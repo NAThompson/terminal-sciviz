@@ -1,0 +1,11 @@
+Google's Turbo look-up table
+(<https://gist.github.com/mikhailov-work/ee72ba4191942acecc03fe6da94fc73f>) is headed:
+
+```
+Copyright 2019 Google LLC.
+SPDX-License-Identifier: Apache-2.0
+
+Author: Anton Mikhailov
+```
+
+The Apache License 2.0 (ColorBrewer and Turbo) is in Apache-2.0.txt.

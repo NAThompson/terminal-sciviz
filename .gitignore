@@ -1,0 +1,9 @@
+# generated
+deno/gallery/out/
+deno/.deno.generated.*.json
+__pycache__/
+*.pyc
+# editor / OS
+.DS_Store
+# plugin engine
+.claude-plugin/types/

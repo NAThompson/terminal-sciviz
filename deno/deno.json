@@ -1,0 +1,17 @@
+{
+  "compilerOptions": {
+    "lib": [
+      "deno.window",
+      "dom"
+    ]
+  },
+  "tasks": {
+    "surface": "deno run -A surface.ts",
+    "plot1d": "deno run -A plot1d.ts",
+    "line": "deno run -A line.ts",
+    "curve": "deno run -A curve.ts",
+    "gallery": "deno run -A gallery/gallery.ts render",
+    "gallery-check": "deno run -A gallery/gallery.ts check",
+    "manifest": "deno run -A gallery/gallery.ts manifest"
+  }
+}

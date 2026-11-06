@@ -1,0 +1,13 @@
+{
+  "name": "terminal-sciviz",
+  "owner": {
+    "name": "Nick Thompson"
+  },
+  "plugins": [
+    {
+      "name": "sciviz",
+      "source": "./"
+    }
+  ],
+  "description": "Live, interactive WebGPU scientific visualization inline in the Claude Code chat"
+}
