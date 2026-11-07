@@ -58,7 +58,7 @@ import {
   SAMPLES_PER_VOXEL,
 } from "./lib/volume_utils.ts";
 import { CENTROID_BASE, getCaseTriangles } from "./lib/marching_cubes.ts";
-import { cameraBasis, fitView, type Vec3 } from "./lib/framing.ts";
+import { cameraBasis, fitAngles, fitView, type Vec3 } from "./lib/framing.ts";
 import { makeReadBuffer, rowBytes } from "./lib/gpu.ts";
 import { BitmapFont, type FontSize, FRAME_FORMAT, OverlayRenderer, premul, Quads, type Rgba, rootSlider, type RootSlider, rootSliderHeight } from "./lib/overlay.ts";
 import { main, type Pending, type Renderer as ServeRenderer } from "./lib/serve.ts";
@@ -1515,7 +1515,7 @@ export class VolumePlot implements ServeRenderer<Control> {
         for (const sy of [-1, 1]) fitPoint(sgn * hw, sy * hh, hd + 0.1);
       }
     }
-    const fit = fitView(corners, ctl.azimuth, ctl.elevation, FOV, pw / ph) ?? [[0, 0, 0] as Vec3, 3];
+    const fit = fitView(corners, ...fitAngles(ctl), FOV, pw / ph) ?? [[0, 0, 0] as Vec3, 3];
     const target = fit[0];
     const distance = fit[1] / (Number(ctl.zoom) || 1);
     const [f] = cameraBasis(ctl.azimuth, ctl.elevation);

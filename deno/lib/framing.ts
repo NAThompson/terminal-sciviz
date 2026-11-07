@@ -5,6 +5,13 @@ export type Vec3 = [number, number, number];
 
 export const MAX_ELEVATION = 89.9; // degrees; z stays "up" in the image
 
+/** The view angles the camera is fitted from: `fitAt` [azimuth, elevation] when set (the client
+ * pins it while orbiting, so the pivot and distance stay put), else the view's own. */
+export function fitAngles(ctl: { azimuth: number; elevation: number; fitAt?: unknown }): [number, number] {
+  const f = ctl.fitAt;
+  return Array.isArray(f) && f.length === 2 && f.every((x) => Number.isFinite(x)) ? [f[0], f[1]] : [ctl.azimuth, ctl.elevation];
+}
+
 const cross = (a: Vec3, b: Vec3): Vec3 => [
   a[1] * b[2] - a[2] * b[1],
   a[2] * b[0] - a[0] * b[2],

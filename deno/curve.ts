@@ -16,7 +16,7 @@
  */
 
 import { axisTicks, colorBarTicks, createScale, formatNumber, snapRootN } from "./lib/scales.ts";
-import { cameraBasis, fitView, type Vec3 } from "./lib/framing.ts";
+import { cameraBasis, fitAngles, fitView, type Vec3 } from "./lib/framing.ts";
 import { lookAtView, mul4, perspectiveProjection } from "./lib/mat4.ts";
 import { colormapName, colormapRgb, getLinearColorLut } from "./lib/colormaps.ts";
 import {
@@ -593,7 +593,7 @@ export class CurvePlot implements ServeRenderer<Control> {
     const [L, T, R, B] = [Math.round(16 * s), Math.round(56 * s), w - Math.round(16 * s) - bar, h - Math.round(16 * s)];
     this.plot3 = [L, T, R, B];
     const [pw, ph] = [R - L, B - T];
-    const fit = fitView(this.fitPoints, ctl.azimuth, ctl.elevation, FOV, pw / ph) ?? [[0, 0, 0], 3];
+    const fit = fitView(this.fitPoints, ...fitAngles(ctl), FOV, pw / ph) ?? [[0, 0, 0], 3];
     this.target = fit[0];
     this.distance = fit[1] / (Number(ctl.zoom) || 1);
     const [f] = cameraBasis(ctl.azimuth, ctl.elevation);

@@ -14,7 +14,7 @@
  * the frame by lib/overlay.ts.
  */
 
-import { cameraBasis, fitView, type Vec3 } from "./lib/framing.ts";
+import { cameraBasis, fitAngles, fitView, type Vec3 } from "./lib/framing.ts";
 import { lookAtView, mul4, perspectiveProjection } from "./lib/mat4.ts";
 import { getLinearColorLut, colormapName, colormapRgb } from "./lib/colormaps.ts";
 import { colorBarTicks, createScale, getShaderScale, snapRootN, type VisScale } from "./lib/scales.ts";
@@ -357,9 +357,9 @@ export class SurfaceRenderer implements ServeRenderer<Control> {
     }
     await this.setSurface(ctl);
     const aspect = ctl.width / ctl.height;
-    const key = JSON.stringify([this.surfaceKey, ctl.azimuth, ctl.elevation, aspect]);
+    const key = JSON.stringify([this.surfaceKey, ...fitAngles(ctl), aspect]);
     if (key !== this.fitKey) {
-      this.fit = fitView(this.fitPoints, ctl.azimuth, ctl.elevation, FOV, aspect) ?? [[0, 0, 0], 3]; // no valid vertex
+      this.fit = fitView(this.fitPoints, ...fitAngles(ctl), FOV, aspect) ?? [[0, 0, 0], 3]; // no valid vertex
       this.fitKey = key;
     }
     const [target, distance] = this.fit;

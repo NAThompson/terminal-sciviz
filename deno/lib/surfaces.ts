@@ -1,6 +1,6 @@
-/** Sample surfaces (torus, sphere, `wave`, `wave-test`), as `NurbsSurface`s. Data only. */
+/** Sample surfaces (torus, sphere, `wave`, `wave-test`, `dini`, `breather`), as `NurbsSurface`s. Data only. */
 
-import type { NurbsSurface } from "./nurbs.ts";
+import { findSpan, getBasisFunctions, type NurbsSurface } from "./nurbs.ts";
 
 const S = Math.sqrt(0.5);
 const CIRCLE = [[1, 0], [1, 1], [0, 1], [-1, 1], [-1, 0], [-1, -1], [0, -1], [1, -1], [1, 0]];
@@ -70,9 +70,91 @@ function wave(): NurbsSurface {
   return { degrees: [3, 3], shape: [n, n], points: pts, weights: wts, knots: [knots, knots], fields: [fld] };
 }
 
+/** Global cubic interpolation along one direction (Piegl & Tiller A9.1): `n` samples at uniform
+ * parameters, knots by averaging; the collocation matrix is banded and totally positive, so it is
+ * factored once without pivoting and `solve` turns samples into control values in place. */
+function cubicInterpolator(n: number) {
+  const p = 3, band = 2 * p;
+  const t = Array.from({ length: n }, (_, i) => i / (n - 1));
+  const inner = Array.from({ length: n - p - 1 }, (_, j) => (t[j + 1] + t[j + 2] + t[j + 3]) / 3);
+  const knots = [0, 0, 0, 0, ...inner, 1, 1, 1, 1];
+  const kv = { degree: p, knots };
+  const A = Array.from({ length: n }, () => new Float64Array(n));
+  t.forEach((u, i) => {
+    const k = findSpan(kv, u);
+    getBasisFunctions(kv, k, u).forEach((b, r) => (A[i][k - p + r] = b));
+  });
+  for (let c = 0; c < n; c += 1) { // LU, in place (L below the diagonal, unit diagonal implied)
+    for (let r = c + 1; r < Math.min(n, c + band + 1); r += 1) {
+      const f = A[r][c] / A[c][c];
+      if (!f) continue;
+      A[r][c] = f;
+      for (let k = c + 1; k < Math.min(n, c + band + 1); k += 1) A[r][k] -= f * A[c][k];
+    }
+  }
+  const solve = (b: Float64Array) => {
+    for (let r = 0; r < n; r += 1) for (let c = Math.max(0, r - band); c < r; c += 1) b[r] -= A[r][c] * b[c];
+    for (let r = n - 1; r >= 0; r -= 1) {
+      for (let c = r + 1; c < Math.min(n, r + band + 1); c += 1) b[r] -= A[r][c] * b[c];
+      b[r] /= A[r][r];
+    }
+  };
+  return { knots, solve };
+}
+
+/** A bicubic B-spline through `nu × nv` samples of `f(s, t)` (s, t in [0, 1]) -> [x, y, z, field]:
+ * it passes exactly through every sample, smooth (C²) in between. */
+function interpolated(nu: number, nv: number, f: (s: number, t: number) => number[]): NurbsSurface {
+  const U = cubicInterpolator(nu), V = cubicInterpolator(nv);
+  const ch = Array.from({ length: 4 }, () => new Float64Array(nu * nv)); // x, y, z, field; [i * nv + j]
+  for (let i = 0; i < nu; i += 1) {
+    for (let j = 0; j < nv; j += 1) f(i / (nu - 1), j / (nv - 1)).forEach((x, c) => (ch[c][i * nv + j] = x));
+  }
+  const row = new Float64Array(nv), col = new Float64Array(nu);
+  for (const a of ch) {
+    for (let i = 0; i < nu; i += 1) { row.set(a.subarray(i * nv, (i + 1) * nv)); V.solve(row); a.set(row, i * nv) }
+    for (let j = 0; j < nv; j += 1) {
+      for (let i = 0; i < nu; i += 1) col[i] = a[i * nv + j];
+      U.solve(col);
+      for (let i = 0; i < nu; i += 1) a[i * nv + j] = col[i];
+    }
+  }
+  const points = Array.from({ length: nu * nv * 3 }, (_, k) => ch[k % 3][Math.floor(k / 3)]);
+  return { degrees: [3, 3], shape: [nu, nv], points, weights: Array(nu * nv).fill(1), knots: [U.knots, V.knots], fields: [Array.from(ch[3])] };
+}
+
+/** Dini's surface (a = 1, b = 0.2: two turns of a twisted pseudosphere, curvature -1/(a² + b²)
+ * everywhere), with field the height along its axis. */
+function dini(): NurbsSurface {
+  const a = 1, b = 0.2;
+  return interpolated(96, 48, (s, t) => {
+    const u = 4 * Math.PI * s, v = 0.06 + (2 - 0.06) * t;
+    const z = a * (Math.cos(v) + Math.log(Math.tan(v / 2))) + b * u;
+    return [a * Math.cos(u) * Math.sin(v), a * Math.sin(u) * Math.sin(v), z, z];
+  });
+}
+
+/** Breather surface of the sine-Gordon equation (a = 0.4; pseudospherical: curvature -1, cusps
+ * along its edges), with field the breather angle 4 atan((a/w) sin(w v) / cosh(a u)) it is built from. */
+function breather(): NurbsSurface {
+  const a = 0.4, w = Math.sqrt(1 - a * a);
+  return interpolated(140, 400, (s, t) => {
+    const u = -14 + 28 * s, v = -37.4 + 74.8 * t;
+    const ch = Math.cosh(a * u), d = a * ((w * ch) ** 2 + (a * Math.sin(w * v)) ** 2);
+    return [
+      -u + (2 * w * w * ch * Math.sinh(a * u)) / d,
+      (2 * w * ch * (-w * Math.cos(v) * Math.cos(w * v) - Math.sin(v) * Math.sin(w * v))) / d,
+      (2 * w * ch * (-w * Math.sin(v) * Math.cos(w * v) + Math.cos(v) * Math.sin(w * v))) / d,
+      4 * Math.atan(((a / w) * Math.sin(w * v)) / ch),
+    ];
+  });
+}
+
 export const SURFACES: Record<string, () => NurbsSurface> = {
   wave,
   torus,
   sphere,
   "wave-test": waveTest,
+  dini,
+  breather,
 };

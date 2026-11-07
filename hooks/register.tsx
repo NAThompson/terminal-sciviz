@@ -51,7 +51,7 @@ function cellSize(s: Shown, viewport?: { columns: number; rows: number }) {
 // Protocol: control.json carries an increasing `rev`; frame lines are `frame <gen> <w> <h> <shm|-> <rev>`;
 // a snapshot request {path, rev} is acknowledged by `snapshot <rev> <path>` once a frame at/after rev
 // is saved. Writes are coalesced (the renderer retries a torn file and ignores stale revs).
-// The newest view (a tool result or a /sciviz-* output) is live: frames are blitted into it and a
+// The newest view (a tool result or a /sciviz output) is live: frames are blitted into it and a
 // transparent Client over it takes the pointer and keys. Older views freeze on the PNG of their
 // last settled frame (`${RUN}/views/<id>.png`).
 const VIEW_TOOL = 'mcp__sciviz__view'
@@ -65,7 +65,7 @@ let DENO = '' // absolute path, or '' when none was found
 const MAX_FRAME_PX = 4096 // ImageSource limit for shm/file frames
 const DRAG_SCALE = 0.55 // resolution while dragging (faster frames); full Retina again on release
 const VIEW_ASPECT = 16 / 10 // pixels, width / height
-const SURFACES = ['wave', 'torus', 'sphere', 'wave-test']
+const SURFACES = ['wave', 'torus', 'sphere', 'dini', 'breather', 'wave-test']
 const COLORMAPS = ['viridis', 'magma', 'inferno', 'plasma']
 const COLOR_BY = ['field', 'height', 'gaussian-curvature', 'mean-curvature']
 const FUNCTIONS = ['bumps', 'runge', 'step', 'blocks']
@@ -401,7 +401,7 @@ async function onKey($: any, kind: Kind, k: string) {
   const info = viewInfo[view.live]
   const interaction = info?.interaction ?? legacyInteraction(kind)
   if (k === 'r' && info) { // back to how the view opened
-    for (const key of ['azimuth', 'elevation', 'zoom', 'x0', 'x1', 'y0', 'y1', 'ymin', 'ymax'])
+    for (const key of ['azimuth', 'elevation', 'zoom', 'fitAt', 'x0', 'x1', 'y0', 'y1', 'ymin', 'ymax'])
       if (key in info.home) ctl[key] = info.home[key]
       else delete ctl[key] // back to the renderer's default
     return settle($)
@@ -530,7 +530,12 @@ async function onPointer($: any, kind: Kind, ev: any) {
   }
   if (ev.type === 'down') {
     const win = interaction === 'orbit' ? null : await readWindow($, kind)
-    if (interaction === 'orbit') await resolveCamera($, kind)
+    if (interaction === 'orbit') {
+      await resolveCamera($, kind)
+      // orbit about a fixed pivot: keep the framing of the angle the first drag started from
+      // (re-fitting at every angle slides the pivot and pumps the distance); r or a tool call clears it
+      ctl.fitAt ??= [ctl.azimuth, ctl.elevation]
+    }
     view.drag = { x, y, ctl: { ...ctl }, win, zooming: !!ev.shift }
     ctl.hover = null
     // lower resolution while orbiting (3D frames cost most); 2D keeps its layout so pan/zoom stay anchored
@@ -592,6 +597,7 @@ async function showViewNow($: any, e: any, kind: Kind, keys: string[], replace?:
   const ctl = KINDS[kind].ctl
   Object.assign(ctl, { width: view.pxW, height: view.pxH }) // the size the row will show it at, not a default
   for (const k of keys) if (input[k] !== undefined) ctl[k] = input[k]
+  if (['azimuth', 'elevation', 'zoom', 'surface'].some((k) => keys.includes(k) && input[k] !== undefined)) delete ctl.fitAt // a new view: fit it afresh
   const id = String(e.tool_use_id)
   kindOf[id] = kind
   viewInfo[id] = { interaction: entry?.interaction ?? legacyInteraction(kind), home: { ...ctl }, entry }
@@ -616,12 +622,13 @@ async function showViewNow($: any, e: any, kind: Kind, keys: string[], replace?:
   return { result: JSON.stringify({ snapshot: done ? png : null, ...(problem ? { error: problem } : {}), entry: entry?.id, control: brief, state: briefState }) }
 }
 
-/** /sciviz-view and /sciviz-plot: the output row about to be drawn becomes the live view. */
+/** /sciviz <surface>: the output row about to be drawn becomes the live view. */
 async function openView($: any, e: any, kind: Kind, field: string, options: string[]) {
   const arg = String(e.args ?? '').trim()
   await checkDeno($)
   if (setupError) return { text: `sciviz: ${setupError}` }
   if (options.includes(arg)) KINDS[kind].ctl[field] = arg
+  delete KINDS[kind].ctl.fitAt
   const tok = `v${++openSeq}`
   opens[tok] = { kind, interaction: legacyInteraction(kind), home: { ...KINDS[kind].ctl } }
   latestOpen = tok
@@ -645,7 +652,7 @@ function findEntries(all: Entry[], typed: string): Entry[] {
   return all.filter((x) => (!section || x.section === section) && x.id.split('/')[1].toLowerCase().includes(name))
 }
 
-/** /sciviz-open <entry id>: the gallery entry as a live view in the output row. */
+/** /sciviz <entry id>: the gallery entry as a live view in the output row. */
 async function openEntry($: any, e: any) {
   const id = String(e.args ?? '').trim()
   if (SECTIONS.includes(id)) // a section on its own: list it
@@ -655,7 +662,7 @@ async function openEntry($: any, e: any) {
   if (found.length !== 1) {
     return { text: found.length
       ? `sciviz: "${id}" matches ${found.map((x) => x.id).join(', ')}; which one?`
-      : `sciviz: no gallery entry "${id}". /sciviz-gallery [${SECTIONS.join('|')}] lists them.` }
+      : `sciviz: no gallery entry "${id}". /sciviz [${SECTIONS.join('|')}] shows them.` }
   }
   await checkDeno($)
   if (setupError) return { text: `sciviz: ${setupError}` }
@@ -745,15 +752,12 @@ async function resolvePaths($: any, options: Record<string, unknown>) {
 }
 
 export const register: Register = (on, options) => {
-  on('command.run', { command: 'sciviz-view' }, ($, e) => {
+  // one command: /sciviz [section] shows a contact sheet, /sciviz <entry> or <surface> opens a live view
+  on('command.run', { command: 'sciviz' }, async ($, e) => {
     const arg = String((e as any).args ?? '').trim()
-    return arg && !SURFACES.includes(arg) ? openEntry($, e) : openView($, e, 'surface', 'surface', SURFACES)
-  })
-  on('command.run', { command: 'sciviz-plot' }, ($, e) => openView($, e, 'pchip', 'function', FUNCTIONS))
-  on('command.run', { command: 'sciviz-open' }, ($, e) => openEntry($, e))
-  on('command.run', { command: 'sciviz-gallery' }, async ($, e) => {
-    const section = String((e as any).args ?? '').trim() || 'lines'
-    if (!SECTIONS.includes(section)) return openEntry($, e) // an entry id: open it, as /sciviz-open does
+    if (SURFACES.includes(arg)) return openView($, e, 'surface', 'surface', SURFACES)
+    if (arg && !SECTIONS.includes(arg)) return openEntry($, e)
+    const section = arg || 'lines'
     const ids = (await entries($)).filter((x) => x.section === section).map((x) => x.id)
     return { text: `${section}: ${ids.join('  ')}` }
   })
@@ -761,7 +765,7 @@ export const register: Register = (on, options) => {
   on('ui.render', { component: 'CommandOutput' }, async ($, e, next) => {
     const command = (e.props as any).command
     if (e.surface !== 'terminal') return next(e)
-    if (command === 'sciviz-gallery' && SECTIONS.includes(String((e.props as any).args ?? '').trim() || 'lines')) { // the section's contact sheet, then its entry ids
+    if (command === 'sciviz' && SECTIONS.includes(String((e.props as any).args ?? '').trim() || 'lines')) { // the section's contact sheet, then its entry ids
       const { Box, Image, Text } = $.ui.resolve(e) as any
       const section = String((e.props as any).args ?? '').trim() || 'lines'
       const png = `${ROOT}/docs/contact_${section}.png`
@@ -773,11 +777,11 @@ export const register: Register = (on, options) => {
       return (
         <Box flexDirection="column">
           <Image source={{ file: png, format: 'png' }} columns={cols} rows={rows} alt={`sciviz gallery: ${section}`} />
-          <Text dimColor>{String((e.props as any).text ?? '')}  ·  /sciviz-open {'<id>'}</Text>
+          <Text dimColor>{String((e.props as any).text ?? '')}  ·  /sciviz {'<id>'}</Text>
         </Box>
       )
     }
-    if (command !== 'sciviz-view' && command !== 'sciviz-plot' && command !== 'sciviz-open' && command !== 'sciviz-gallery') return next(e)
+    if (command !== 'sciviz') return next(e)
     const id = String(e.requestId)
     const tok = /#(v\d+)\b/.exec(String((e.props as any).text ?? ''))?.[1]
     if (!tok && !kindOf[id]) return next(e) // a message (setup error, "which one?"), not a view: show its text
@@ -788,7 +792,7 @@ export const register: Register = (on, options) => {
       viewInfo[id] = { interaction: open.interaction, home: open.home, entry: open.entry }
       if (tok === latestOpen) { latestOpen = ''; view.intended = id }
     }
-    const kind = kindOf[id] ?? (command === 'sciviz-view' ? 'surface' : command === 'sciviz-plot' ? 'pchip' : undefined)
+    const kind = kindOf[id]
     if (!kind) return next(e)
     return drawView($, e, id, kind)
   })
@@ -830,10 +834,7 @@ export const register: Register = (on, options) => {
 
   on('session.start', async ($, e, next) => {
     await resolvePaths($, options ?? {})
-    await $.command.register({ name: 'sciviz-view', description: 'Live view inline: /sciviz-view [wave|torus|sphere|wave-test] or a gallery entry (e.g. lines/pchip_blocks, or just blocks)' })
-    await $.command.register({ name: 'sciviz-plot', description: 'Live GPU PCHIP plot inline: /sciviz-plot [bumps|runge|step|blocks]' })
-    await $.command.register({ name: 'sciviz-gallery', description: 'Gallery contact sheet: /sciviz-gallery [lines|curves|complex|volumes], or an entry id to open it' })
-    await $.command.register({ name: 'sciviz-open', description: 'Open a gallery entry as a live view: /sciviz-open lines/residual' })
+    await $.command.register({ name: 'sciviz', description: `Inline WebGPU views: /sciviz [${SECTIONS.join('|')}] (contact sheet), /sciviz <entry> (live view, e.g. lorenz, chirp, blocks), /sciviz ${SURFACES.filter((x) => !x.endsWith('-test')).join('|')} (NURBS surface)` })
     const ids = (await entries($)).map((x) => x.id)
     await $.tool.register({
       name: 'gallery_open',
@@ -885,7 +886,7 @@ export const register: Register = (on, options) => {
       inputSchema: {
         type: 'object',
         properties: {
-          surface: { type: 'string', enum: ['wave', 'torus', 'sphere', 'wave-test'] },
+          surface: { type: 'string', enum: SURFACES, description: 'dini and breather: pseudospherical surfaces (curvature -1), coloured by height / the sine-Gordon angle' },
           colorBy: { type: 'string', enum: ['field', 'height', 'field-gradient', 'height-gradient', 'gaussian-curvature', 'mean-curvature'] },
           colormap: { type: 'string', enum: ['viridis', 'magma', 'inferno', 'plasma'] },
           azimuth: { type: 'number', description: 'degrees' },

@@ -26,8 +26,8 @@ before you talk about it, and the renderer `state` (window, value ranges, camera
 
 Tell the user how to drive a live view the first time: drag (pan in 2D, orbit in 3D),
 shift-drag or `+`/`-` (zoom), hover (values drawn next to the cursor), click the view then
-`c`/`C` (cycle colour maps within their group), `i` (invert), `r` (reset). Slash commands for them:
-`/sciviz-gallery [section]` (contact sheet), `/sciviz-view <entry or surface>`, `/sciviz-open <entry>`.
+`c`/`C` (cycle colour maps within their group), `i` (invert), `r` (reset). Their one slash command:
+`/sciviz [section]` shows a contact sheet, `/sciviz <entry>` (e.g. `lorenz`) opens a live view.
 
 ## Making images that look right in the terminal
 

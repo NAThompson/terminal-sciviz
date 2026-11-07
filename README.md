@@ -10,8 +10,7 @@ snapshot of exactly what you see.
 ## What's in it
 
 - **A Claude Code plugin** (`sciviz`): tools Claude calls to show images (`show`) and to open live
-  views (`gallery_open`, `view`, `plot`); slash commands for you (`/sciviz-gallery`,
-  `/sciviz-view`, `/sciviz-open`); and a skill, `terminal-graphics`, that teaches Claude how to
+  views (`gallery_open`, `view`, `plot`); one slash command for you (`/sciviz`); and a skill, `terminal-graphics`, that teaches Claude how to
   present graphics well in a terminal (transparent backgrounds, theme colours, native resolution,
   side-by-side comparisons).
 - **WebGPU renderers** (`deno/`), headless, one process per kind of view:
@@ -53,7 +52,13 @@ needed. (The short form `NAThompson/terminal-sciviz` tries SSH first, which fail
 machines without a GitHub SSH key.)
 
 Then ask Claude to show you something (“plot the Lorenz attractor”, “show the gallery”), or run
-`/sciviz-gallery lines` and `/sciviz-view lorenz`.
+`/sciviz` yourself:
+
+| Command | Shows |
+|---|---|
+| `/sciviz [lines\|curves\|complex\|volumes]` | that section's contact sheet and entry ids |
+| `/sciviz <entry>` | the entry as a live view; partial names work (`lorenz`, `chirp`, `blocks`) |
+| `/sciviz torus\|wave\|sphere\|dini\|breather` | a live NURBS surface (Dini and the sine-Gordon breather are bicubic interpolants of their parametrisations) |
 
 ### Controls in a live view
 
