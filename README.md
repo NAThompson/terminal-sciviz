@@ -48,10 +48,6 @@ At the prompt of a Claude Code session:
 
 From a shell: `claude plugin install sciviz --marketplace https://github.com/NAThompson/terminal-sciviz.git`.
 
-The full `https://` URL clones the public repository anonymously, so no GitHub account or SSH key is
-needed. (The short form `NAThompson/terminal-sciviz` tries SSH first, which fails inside a session on
-machines without a GitHub SSH key.)
-
 Then ask Claude to show you something (“plot the Lorenz attractor”, “show the gallery”), or run
 `/sciviz` yourself:
 
