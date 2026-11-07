@@ -244,6 +244,15 @@ export interface BoostMath {
   struve_l_prime(v: number, x: number): number;
   struve_l_array(v: number, xs: Samples): Float64Array;
   struve_l_prime_array(v: number, xs: Samples): Float64Array;
+  /** Fresnel integrals C(x) = ∫₀ˣ cos(πt²/2) dt and S(x) = ∫₀ˣ sin(πt²/2) dt (the normalized convention of DLMF 7.2, mpmath, SciPy). */
+  fresnel_c(x: number): number;
+  fresnel_c_array(xs: Samples): Float64Array;
+  fresnel_s(x: number): number;
+  fresnel_s_array(xs: Samples): Float64Array;
+  /** C(x) + i S(x) for the cost of one of them: [C, S]. */
+  fresnel_cis(x: number): Float64Array;
+  /** Interleaved: [C(x0), S(x0), C(x1), S(x1), ...], 2 xs.length numbers. */
+  fresnel_cis_array(xs: Samples): Float64Array;
   jacobi_theta1(x: number, q: number): number;
   jacobi_theta1_array(x: number, qs: Samples): Float64Array;
   jacobi_theta2(x: number, q: number): number;

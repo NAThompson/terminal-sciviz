@@ -6,7 +6,8 @@
 
 import type { Entry } from "./types.ts";
 import { periodic } from "../curve.ts";
-import { fresnel, linspace } from "../lib/specfun.ts";
+import { fresnel } from "../lib/boost.ts";
+import { linspace } from "../lib/specfun.ts";
 
 const PI = Math.PI;
 const S2 = Math.sqrt(0.5);

@@ -137,9 +137,9 @@ carries no licence of its own. `deno/lib/surfaces.ts` reads it as 32 degree-3 ×
 
 ## Boost.Math
 
-`deno/vendor/boost-math-wasm/` is boost-math-wasm 0.4.0, an unofficial Emscripten build of
+`deno/vendor/boost-math-wasm/` is boost-math-wasm 0.5.0, an unofficial Emscripten build of
 [Boost.Math](https://www.boost.org/libs/math) from the fork <https://github.com/NAThompson/math>
-(release `boost-math-v0.4.0`), redistributed unmodified; its README there gives the source URL
+(release `boost-math-v0.5.0`), redistributed unmodified; its README there gives the source URL
 and SHA-256. `deno/lib/boost.ts` loads it to evaluate special functions, function curves and
 distribution quantiles in double precision. Boost.Math is under the Boost Software License 1.0,
 the Emscripten runtime and the musl libc parts compiled in under their MIT-style licences; all are

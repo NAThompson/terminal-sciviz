@@ -24,5 +24,13 @@ function using<T>(d: Distribution, f: (d: Distribution) => T): T {
 export const normalQuantiles = (ps: ArrayLike<number>) => using(new bm.normal_distribution(0, 1), (d) => d.quantile_array(ps));
 export const normalQuantile = (p: number) => normalQuantiles([p])[0];
 
+/** The Fresnel integrals C(t) + i S(t) = ∫₀ᵗ exp(iπs²/2) ds (normalised, DLMF 7.2) at each t: [C, S]. */
+export function fresnel(t: ArrayLike<number>): [Float64Array, Float64Array] {
+  const cs = bm.fresnel_cis_array(t); // interleaved C0, S0, C1, S1, ...
+  const c = new Float64Array(t.length), s = new Float64Array(t.length);
+  for (let i = 0; i < t.length; i += 1) [c[i], s[i]] = [cs[2 * i], cs[2 * i + 1]];
+  return [c, s];
+}
+
 /** Student's t quantile with `df` degrees of freedom. */
 export const tQuantile = (p: number, df: number) => using(new bm.students_t_distribution(df), (d) => d.quantile(p));

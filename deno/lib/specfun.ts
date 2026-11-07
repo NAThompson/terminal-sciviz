@@ -1,37 +1,4 @@
-/** Data helpers of the gallery: the Fresnel integrals (Boost.Math, lib/boost.ts, has none), by
- * quadrature in f64, and a seeded normal generator for its noisy series. */
-
-/** `fresnel`: C(t) + i S(t) = ∫₀ᵗ exp(iπs²/2) ds by cumulative trapezoid (200 001 points on
- * [0, max |t|]), interpolated linearly. Returns [re, im] arrays. */
-export function fresnel(t: ArrayLike<number>): [Float64Array, Float64Array] {
-  let tmax = 0;
-  for (let i = 0; i < t.length; i += 1) tmax = Math.max(tmax, Math.abs(t[i]));
-  const m = 200_001;
-  const ds = tmax / (m - 1);
-  const cre = new Float64Array(m);
-  const cim = new Float64Array(m);
-  let pr = 1, pi = 0;
-  for (let k = 1; k < m; k += 1) {
-    const s = k * ds;
-    const a = (Math.PI * s * s) / 2;
-    const fr = Math.cos(a), fi = Math.sin(a);
-    cre[k] = cre[k - 1] + ((fr + pr) / 2) * ds;
-    cim[k] = cim[k - 1] + ((fi + pi) / 2) * ds;
-    pr = fr;
-    pi = fi;
-  }
-  const re = new Float64Array(t.length);
-  const im = new Float64Array(t.length);
-  for (let i = 0; i < t.length; i += 1) {
-    const u = Math.abs(t[i]) / ds;
-    const k = Math.min(Math.floor(u), m - 2);
-    const f = u - k;
-    const sg = Math.sign(t[i]);
-    re[i] = sg * (cre[k] + f * (cre[k + 1] - cre[k]));
-    im[i] = sg * (cim[k] + f * (cim[k + 1] - cim[k]));
-  }
-  return [re, im];
-}
+/** Data helpers of the gallery: a seeded normal generator for its noisy series, and `linspace`. */
 
 /** Standard normal deviates from a seeded mulberry32 stream (Box–Muller). Not numpy's PCG64:
  * same distribution, other draws. */
