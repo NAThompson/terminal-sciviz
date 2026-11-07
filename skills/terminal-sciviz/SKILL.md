@@ -1,5 +1,5 @@
 ---
-name: terminal-graphics
+name: terminal-sciviz
 description: How to present graphics to the user inside the terminal chat with the sciviz mod — static images (mcp__sciviz__show), live interactive WebGPU views (mcp__sciviz__gallery_open, mcp__sciviz__view, mcp__sciviz__plot), and how to make plots that look right there. Use whenever a picture, plot, comparison, 3D view or interactive exploration would help the user, before writing any plotting code, and whenever you're tempted to describe something visual in words.
 ---
 

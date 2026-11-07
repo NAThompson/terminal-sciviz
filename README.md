@@ -10,7 +10,7 @@ snapshot of exactly what you see.
 ## What's in it
 
 - **A Claude Code plugin** (`sciviz`): tools Claude calls to show images (`show`) and to open live
-  views (`gallery_open`, `view`, `plot`); one slash command for you (`/sciviz`); and a skill, `terminal-graphics`, that teaches Claude how to
+  views (`gallery_open`, `view`, `plot`); one slash command for you (`/sciviz`); and a skill, `/sciviz:terminal-sciviz`, that teaches Claude how to
   present graphics well in a terminal (transparent backgrounds, theme colours, native resolution,
   side-by-side comparisons).
 - **WebGPU renderers** (`deno/`), headless, one process per kind of view:
