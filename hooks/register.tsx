@@ -78,7 +78,8 @@ function nextColorMap(cur: string, step: number): string {
   const lc = String(cur ?? '').toLowerCase()
   const group = [CYCLICAL_MAPS, DIVERGING_MAPS, SEQUENTIAL_MAPS].find((g) => g.some((m) => m.toLowerCase() === lc)) ?? SEQUENTIAL_MAPS
   const i = group.findIndex((m) => m.toLowerCase() === lc)
-  return group[(Math.max(i, 0) + step + group.length) % group.length]
+  const next = group[(Math.max(i, 0) + step + group.length) % group.length] ?? cur
+  return cur && cur === lc ? next.toLowerCase() : next
 }
 const BLANK = 'AAAAAA==' // 1x1 transparent RGBA
 const HOME = { azimuth: 35, elevation: 25, zoom: 1 }
@@ -90,6 +91,8 @@ type Kind = string
 type Entry = { id: string; section: string; title: string; description: string; renderer: string; control: Ctl;
   interaction: Interaction; playback?: { fps: number; slices: number } }
 let GALLERY = ''
+/** The last live view's size (cells and frame px), so a tool call's first snapshot after a reload is full size. */
+const SIZE_FILE = () => `${denoSearch.home}/.cache/terminal-sciviz/view-size.json`
 const SECTIONS = ['lines', 'curves', 'complex', 'volumes']
 
 const KINDS: Record<Kind, { script: string; ctl: Ctl }> = {
@@ -333,6 +336,7 @@ async function drawView($: any, e: any, id: string, kind: Kind) {
   // exactly the box's device pixels, so Ghostty shows the frame 1:1 (scaled down only past MAX_FRAME_PX)
   const fit = Math.min(1, MAX_FRAME_PX / (cols * CELL_PX_W), MAX_FRAME_PX / (rows * CELL_PX_H))
   const pxW = Math.round(cols * CELL_PX_W * fit), pxH = Math.round(rows * CELL_PX_H * fit)
+  if (pxW !== view.pxW || pxH !== view.pxH) void $.fs.write(SIZE_FILE(), JSON.stringify({ cols, rows, pxW, pxH })).catch(() => {})
   Object.assign(view, { pxW, pxH })
   if (!view.drag && (pxW !== ctl.width || pxH !== ctl.height)) { Object.assign(ctl, { width: pxW, height: pxH }); if (running[kind]) void writeControl($, kind) }
   void startRenderer($, kind)
@@ -489,7 +493,8 @@ async function writeOverlay($: any, text: string) {
 async function onPointer($: any, kind: Kind, ev: any) {
   const ctl = KINDS[kind].ctl
   const interaction = viewInfo[view.live]?.interaction ?? legacyInteraction(kind)
-  const cols = ev.columns || view.cols, rows = ev.rows || view.rows
+  // the image's own size in cells: the input region can be clipped by the screen edge, the image's coordinates are not
+  const cols = view.cols || ev.columns, rows = view.rows || ev.rows
   const x = ev.fine?.x ?? ev.x + 0.5, y = ev.fine?.y ?? ev.y + 0.5
   // a move with no button held while a drag is open: its `up` was lost (outside the view, a remount).
   // End the drag, or every hover would keep orbiting the camera and re-rendering.
@@ -499,7 +504,7 @@ async function onPointer($: any, kind: Kind, ev: any) {
   void writeOverlay($, JSON.stringify({ seq: ++overlaySeq, type: ev.type, x, y, cols, rows,
     fine: !!ev.fine, drag: ev.type === 'down' || (!!view.drag && ev.type !== 'up' && ev.type !== 'leave'), kind, id: view.live }))
   const sliderAt = async () => {
-    const sl = ctl.scale === 'root' ? await rootSlider($, kind) : null
+    const sl = (Array.isArray(ctl.scale) ? ctl.scale[0] : ctl.scale) === 'root' ? await rootSlider($, kind) : null
     if (!sl) return null
     // hit test in cells, at least a whole cell beyond the track on every side: the slider is under
     // a cell tall on screen and terminal pointer positions are coarse
@@ -585,6 +590,7 @@ async function showViewNow($: any, e: any, kind: Kind, keys: string[], replace?:
   if (setupError) return { result: JSON.stringify({ snapshot: null, error: setupError }) }
   if (replace) KINDS[kind].ctl = { ...replace, ...BASE, rev: KINDS[kind].ctl.rev, width: view.pxW, height: view.pxH }
   const ctl = KINDS[kind].ctl
+  Object.assign(ctl, { width: view.pxW, height: view.pxH }) // the size the row will show it at, not a default
   for (const k of keys) if (input[k] !== undefined) ctl[k] = input[k]
   const id = String(e.tool_use_id)
   kindOf[id] = kind
@@ -735,6 +741,7 @@ async function resolvePaths($: any, options: Record<string, unknown>) {
   const session = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
   RUN = `${home}/.cache/terminal-sciviz/sessions/${session}`
   GALLERY = `${ROOT}/docs`
+  try { Object.assign(view, JSON.parse(await $.fs.read(SIZE_FILE()))) } catch { /* first run: defaults until a view draws */ }
 }
 
 export const register: Register = (on, options) => {
