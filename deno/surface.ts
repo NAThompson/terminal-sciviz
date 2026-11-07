@@ -11,7 +11,9 @@
  * direction, shared among knot spans), framing, the camera, readback, and hover picking: a
  * second fragment entry point appended to the draw shader. `scale: "root"` colours by t^(1/rootN)
  * of the normalised value t (heights unchanged), with a colour bar and a slider for n drawn over
- * the frame by lib/overlay.ts.
+ * the frame by lib/overlay.ts. A surface may be several patches (an array of `NurbsSurface`s, or a
+ * named one such as `teapot`), drawn with one depth buffer, framed and coloured over all of them;
+ * hover reports the patch under the pixel (`patch`, multi-patch only).
  */
 
 import { cameraBasis, fitAngles, fitView, screenRect, type Vec3 } from "./lib/framing.ts";
@@ -45,24 +47,33 @@ import { main, type Pending, type Renderer as ServeRenderer } from "./lib/serve.
 import { SURFACES } from "./lib/surfaces.ts";
 import { complexGridSurface } from "./complex.ts";
 
-/** Named surfaces, plus grids of complex functions as degree-1 B-splines (complex.ts): by name
- * (`"complex-cubic"`: |z³ − 1| as a height field, coloured by phase) or `{complex: "z^3-1", n, domain,
- * zStretch, zScale}`; anything else is an inline `NurbsSurface`. */
-function namedSurface(spec: unknown): NurbsSurface | undefined {
+/** Patches of named surfaces, plus grids of complex functions as degree-1 B-splines (complex.ts):
+ * by name (`"complex-cubic"`: |z³ − 1| as a height field, coloured by phase) or `{complex: "z^3-1", n,
+ * domain, zStretch, zScale}`; an array is inline patches, anything else one inline `NurbsSurface`. */
+function namedSurfaces(spec: unknown): NurbsSurface[] | undefined {
   if (typeof spec === "string") {
-    return spec === "complex-cubic" ? complexGridSurface({ complex: "z^3-1" }) : SURFACES[spec]?.();
+    const named = spec === "complex-cubic" ? complexGridSurface({ complex: "z^3-1" }) : SURFACES[spec]?.();
+    return named && [named].flat();
   }
-  return spec && typeof spec === "object" && "complex" in spec ? complexGridSurface(spec as { complex: string }) : spec as NurbsSurface;
+  if (Array.isArray(spec)) {
+    return spec.length ? spec as NurbsSurface[] : undefined;
+  }
+  if (spec && typeof spec === "object" && "complex" in spec) {
+    return [complexGridSurface(spec as { complex: string })];
+  }
+  return spec ? [spec as NurbsSurface] : undefined;
 }
 
 // Appended to the draw shader: knot coordinates (span + fraction), value and world position
-// under a pixel, written to two colour targets
+// under a pixel, written to two colour targets; world.w is 1 + the index of the patch drawn (0:
+// background)
 const PICK_WGSL = /* wgsl */ `
   struct Pick { @location(0) knotValue: vec4f, @location(1) world: vec4f }
+  @group(1) @binding(0) var<uniform> pickPatch: vec4f; // x: index of the patch
 
   @fragment
   fn pickMain(in: Varyings) -> Pick {
-    return Pick(vec4f(in.knot, in.value), vec4f(in.world, 1.0));
+    return Pick(vec4f(in.knot, in.value), vec4f(in.world, 1.0 + pickPatch.x));
   }
 `;
 
@@ -103,7 +114,7 @@ export const DEFAULTS = {
   hover: null as [number, number] | null,
   frameFile: false, // serve: also write OUTDIR/frame.rgba
   quit: false,
-  surface: "wave" as string | NurbsSurface, // wave | torus | sphere | wave-test | complex-cubic, {complex}, or inline
+  surface: "wave" as string | NurbsSurface | NurbsSurface[], // wave | torus | sphere | dini | breather | teapot | wave-test | complex-cubic, {complex}, inline, or inline patches
   colorBy: "field",
   field: 0,
   domain: null as [number, number] | null, // of the colour map; default: `getColorByDomain`
@@ -191,7 +202,8 @@ export class SurfaceRenderer implements ServeRenderer<Control> {
   private gpu?: NurbsSurfaceGpuRenderer;
   private readonly canvas: TextureTarget;
   private pickPipeline?: GPURenderPipeline;
-  private pickGroup?: { vertices: GPUBuffer; group: GPUBindGroup };
+  private pickGroups: { vertices: GPUBuffer; group: GPUBindGroup; patch: GPUBindGroup }[] = []; // per patch
+  private pickIndices: GPUBuffer[] = []; // per patch: its index (`pickPatch`)
   private readonly pickReads: GPUBuffer[] = []; // per readback slot (frames in flight)
   private pickTargets?: GPUTexture[];
   private readonly frameReads: GPUBuffer[] = [];
@@ -206,12 +218,13 @@ export class SurfaceRenderer implements ServeRenderer<Control> {
   private fitKey?: string;
   private fit: [Vec3, number] = [[0, 0, 0], 3];
 
-  surface!: NurbsSurface;
+  surfaces!: NurbsSurface[]; // patches
   private transform!: SurfaceTransform;
-  private spans!: [KnotSpan[], KnotSpan[]];
+  private spans!: [KnotSpan[], KnotSpan[]][]; // per patch
   colorBy!: NurbsColorBy;
   private field = 0;
-  grid: [number, number] = [0, 0];
+  grid: [number, number] = [0, 0]; // of the first patch
+  private vertexCount = 0; // over all patches
   dataDomain: [number, number] = [-0.5, 0.5];
   private fitPoints = new Float64Array(0); // valid evaluated vertices (world xyz), grown by FIT_MARGIN
   private overlay?: { font: BitmapFont; renderer: OverlayRenderer }; // root scale only
@@ -248,7 +261,7 @@ export class SurfaceRenderer implements ServeRenderer<Control> {
     }
     const spec = JSON.stringify(ctl.surface);
     if (!this.gpu || spec !== this.surfaceSpec) {
-      this.upload(namedSurface(ctl.surface), ctl.surface);
+      this.upload(namedSurfaces(ctl.surface), ctl.surface);
       this.surfaceSpec = spec;
     }
     await this.evaluate(ctl);
@@ -256,24 +269,27 @@ export class SurfaceRenderer implements ServeRenderer<Control> {
     return true;
   }
 
-  private upload(surface: NurbsSurface | undefined, name: unknown): void {
-    if (!surface) {
-      throw new Error(`surface must be one of ${Object.keys(SURFACES)},complex-cubic or a NurbsSurface (got ${name})`);
+  private upload(surfaces: NurbsSurface[] | undefined, name: unknown): void {
+    if (!surfaces) {
+      throw new Error(`surface must be one of ${Object.keys(SURFACES)},complex-cubic, a NurbsSurface or an array of them (got ${name})`);
     }
-    const error = getNurbsSurfaceError(surface);
-    if (error) {
-      throw new Error(error);
-    }
-    if (Math.max(...surface.degrees) > MAX_GPU_DEGREE) {
-      throw new Error(`Degree above the maximum of ${MAX_GPU_DEGREE} for WebGPU rendering`);
+    for (const [k, surface] of surfaces.entries()) {
+      const error = getNurbsSurfaceError(surface);
+      if (error) {
+        throw new Error(surfaces.length > 1 ? `patch ${k}: ${error}` : error);
+      }
+      if (Math.max(...surface.degrees) > MAX_GPU_DEGREE) {
+        throw new Error(`Degree above the maximum of ${MAX_GPU_DEGREE} for WebGPU rendering`);
+      }
     }
 
-    // World box: the control points bound the patch, centred on the origin
-    const p = surface.points;
+    // World box: the control points bound the patches, centred on the origin
     const lo = [Infinity, Infinity, Infinity], hi = [-Infinity, -Infinity, -Infinity]; // no spread: large grids
-    for (let i = 0; i < p.length; i += 1) {
-      lo[i % 3] = Math.min(lo[i % 3], p[i]);
-      hi[i % 3] = Math.max(hi[i % 3], p[i]);
+    for (const { points: p } of surfaces) {
+      for (let i = 0; i < p.length; i += 1) {
+        lo[i % 3] = Math.min(lo[i % 3], p[i]);
+        hi[i % 3] = Math.max(hi[i % 3], p[i]);
+      }
     }
     const extents = lo.map((l, d) => hi[d] - l);
     const longest = Math.max(...extents) || 1;
@@ -283,13 +299,17 @@ export class SurfaceRenderer implements ServeRenderer<Control> {
       offset: [0, 0, 0],
     };
 
-    const vectors = getKnotVectors(surface);
-    this.spans = [getKnotSpans(vectors[0]), getKnotSpans(vectors[1])];
+    this.spans = surfaces.map((surface) => {
+      const vectors = getKnotVectors(surface);
+      return [getKnotSpans(vectors[0]), getKnotSpans(vectors[1])];
+    });
     this.gpu?.dispose();
-    this.gpu = new NurbsSurfaceGpuRenderer(this.device, this.canvas, [surface], [this.spans], this.transform);
-    this.surface = surface;
+    this.gpu = new NurbsSurfaceGpuRenderer(this.device, this.canvas, surfaces, this.spans, this.transform);
+    this.surfaces = surfaces;
     this.lutKey = undefined;
-    this.pickGroup = undefined;
+    this.pickGroups = [];
+    this.pickIndices.forEach((b) => b.destroy());
+    this.pickIndices = surfaces.map((_, k) => createBuffer(this.device, Float32Array.of(k, 0, 0, 0), UNIFORM));
 
     const module = this.device.createShaderModule({ code: DRAW_WGSL + PICK_WGSL });
     this.pickPipeline = this.device.createRenderPipeline({
@@ -309,7 +329,7 @@ export class SurfaceRenderer implements ServeRenderer<Control> {
     if (!modes.includes(ctl.colorBy)) {
       throw new Error(`colorBy must be one of ${modes}`);
     }
-    const hasFields = (this.surface.fields?.length ?? 0) > 0;
+    const hasFields = this.surfaces.every((s) => (s.fields?.length ?? 0) > 0);
     let colorBy = ctl.colorBy as NurbsColorBy;
     if (colorBy.startsWith("field") && !hasFields) {
       colorBy = NurbsColorBy.Height; // no fields to colour by
@@ -317,21 +337,24 @@ export class SurfaceRenderer implements ServeRenderer<Control> {
     this.colorBy = colorBy;
     this.field = hasFields ? Math.trunc(Number(ctl.field)) : 0;
     const res = Math.max(1, Math.trunc(Number(ctl.resolution)));
-    const counts: [Uint32Array, Uint32Array] = [stepCounts(this.spans[0], res), stepCounts(this.spans[1], res)];
-    this.grid = [counts[0].reduce((a, n) => a + n, 1), counts[1].reduce((a, n) => a + n, 1)];
-    const total = this.grid[0] * this.grid[1];
+    const counts = this.spans.map(([su, sv]): [Uint32Array, Uint32Array] => [stepCounts(su, res), stepCounts(sv, res)]);
+    const grids = counts.map(([cu, cv]) => [cu.reduce((a, n) => a + n, 1), cv.reduce((a, n) => a + n, 1)] as [number, number]);
+    this.grid = grids[0];
+    this.vertexCount = grids.reduce((a, [nu, nv]) => a + nu * nv, 0);
 
     gpu.setColorBy(colorBy, this.field);
-    gpu.setSampleCounts([counts]);
+    gpu.setSampleCounts(counts);
     const [vertexData, { values, areas }] = await Promise.all([
-      readBuffer(this.device, this.internals.patches[0].vertices!, total * VERTEX_FLOATS * 4),
-      gpu.readValues([counts]),
+      Promise.all(this.internals.patches.map((patch, k) => readBuffer(this.device, patch.vertices!, grids[k][0] * grids[k][1] * VERTEX_FLOATS * 4))),
+      gpu.readValues(counts),
     ]);
-    const vertices = new Float32Array(vertexData);
     const positions: number[] = [];
-    for (let i = 0; i < total; i += 1) {
-      if (vertices[i * VERTEX_FLOATS + 9] > 0.5) {
-        positions.push(vertices[i * VERTEX_FLOATS], vertices[i * VERTEX_FLOATS + 1], vertices[i * VERTEX_FLOATS + 2]);
+    for (const data of vertexData) {
+      const vertices = new Float32Array(data);
+      for (let i = 0; i < vertices.length / VERTEX_FLOATS; i += 1) {
+        if (vertices[i * VERTEX_FLOATS + 9] > 0.5) {
+          positions.push(vertices[i * VERTEX_FLOATS], vertices[i * VERTEX_FLOATS + 1], vertices[i * VERTEX_FLOATS + 2]);
+        }
       }
     }
     // Grown about their centre by the framing margin (the fit only depends on angles then)
@@ -541,17 +564,23 @@ export class SurfaceRenderer implements ServeRenderer<Control> {
 
   private encodePick(encoder: GPUCommandEncoder, px: number, py: number, pickRead: GPUBuffer): void {
     const [knotValue, world, depth] = this.pickTargets!;
-    const patch = this.internals.patches[0];
-    const vertices = patch.vertices!;
-    if (this.pickGroup?.vertices !== vertices) {
-      this.pickGroup = {
-        vertices,
-        group: this.device.createBindGroup({
-          layout: this.pickPipeline!.getBindGroupLayout(0),
-          entries: [patch.params, this.internals.view, vertices].map((buffer, binding) => ({ binding, resource: { buffer } })),
-        }),
-      };
-    }
+    const { patches } = this.internals;
+    patches.forEach((patch, k) => {
+      const vertices = patch.vertices!;
+      if (this.pickGroups[k]?.vertices !== vertices) {
+        this.pickGroups[k] = {
+          vertices,
+          group: this.device.createBindGroup({
+            layout: this.pickPipeline!.getBindGroupLayout(0),
+            entries: [patch.params, this.internals.view, vertices].map((buffer, binding) => ({ binding, resource: { buffer } })),
+          }),
+          patch: this.device.createBindGroup({
+            layout: this.pickPipeline!.getBindGroupLayout(1),
+            entries: [{ binding: 0, resource: { buffer: this.pickIndices[k] } }],
+          }),
+        };
+      }
+    });
     const pass = encoder.beginRenderPass({
       colorAttachments: [knotValue, world].map((t) => ({
         view: t.createView(),
@@ -562,9 +591,14 @@ export class SurfaceRenderer implements ServeRenderer<Control> {
       depthStencilAttachment: { view: depth.createView(), depthClearValue: 1, depthLoadOp: "clear", depthStoreOp: "discard" },
     });
     pass.setPipeline(this.pickPipeline!);
-    pass.setBindGroup(0, this.pickGroup.group);
     pass.setScissorRect(px, py, 1, 1); // only the hovered pixel is shaded
-    pass.draw(patch.cellCount * 6);
+    patches.forEach((patch, k) => {
+      if (patch.cellCount > 0) {
+        pass.setBindGroup(0, this.pickGroups[k].group);
+        pass.setBindGroup(1, this.pickGroups[k].patch);
+        pass.draw(patch.cellCount * 6);
+      }
+    });
     pass.end();
     [knotValue, world].forEach((texture, i) =>
       encoder.copyTextureToBuffer(
@@ -576,8 +610,8 @@ export class SurfaceRenderer implements ServeRenderer<Control> {
   }
 
   private pickContext(period: [number, number] | null) {
-    const { spans, surface, field, colorBy, transform } = this;
-    return { spans, surface, field, colorBy, transform, shift: this.internals.shift, period };
+    const { spans, surfaces, field, colorBy, transform } = this;
+    return { spans, surfaces, field, colorBy, transform, shift: this.internals.shift, period };
   }
 
   private readPick(pixel: [number, number], pickRead: GPUBuffer, at: ReturnType<SurfaceRenderer["pickContext"]>): unknown {
@@ -588,18 +622,20 @@ export class SurfaceRenderer implements ServeRenderer<Control> {
     if (world[3] < 0.5) {
       return null; // background
     }
+    const patch = Math.min(Math.max(Math.round(world[3]) - 1, 0), at.surfaces.length - 1);
+    const surface = at.surfaces[patch];
     // Knot coordinates (span index + fraction) to parameters of the original knots
     const [u, v] = [0, 1].map((d) => {
-      const spans = at.spans[d];
+      const spans = at.spans[patch][d];
       const s = Math.min(Math.max(Math.floor(knotValue[d]), 0), spans.length - 1);
       const frac = Math.min(Math.max(knotValue[d] - s, 0), 1);
       const { start, end } = spans[s];
       return start + frac * (end - start);
     });
-    const ref = evaluateNurbsSurface(at.surface, u, v); // CPU, f64
-    const fields = at.surface.fields ?? [];
+    const ref = evaluateNurbsSurface(surface, u, v); // CPU, f64
+    const fields = surface.fields ?? [];
     const field = fields.length
-      ? evaluateSurfaceAnalysis(at.surface, u, v, fields[at.field])[NurbsColorBy.Field]
+      ? evaluateSurfaceAnalysis(surface, u, v, fields[at.field])[NurbsColorBy.Field]
       : null;
     const { origin, scale, offset } = at.transform;
     const shift = at.shift;
@@ -607,6 +643,7 @@ export class SurfaceRenderer implements ServeRenderer<Control> {
     const wrap = (x: number) => (hi !== lo ? x - (hi - lo) * Math.floor((x - lo) / (hi - lo)) : x);
     return {
       pixel,
+      ...(at.surfaces.length > 1 ? { patch } : {}),
       u,
       v,
       xyz: ref.point, // CPU (f64) at (u, v)
@@ -642,6 +679,7 @@ export class SurfaceRenderer implements ServeRenderer<Control> {
       valueRange: [...(ctl.domain ?? this.dataDomain)],
       ...(this.slider ? { rootN: this.slider.value, rootSlider: this.slider } : {}),
       grid: [...this.grid],
+      ...(this.surfaces.length > 1 ? { patches: this.surfaces.length, vertices: this.vertexCount } : {}),
       hover,
       renderMs: Math.round(ms * 1000) / 1000,
     };
@@ -658,6 +696,7 @@ export class SurfaceRenderer implements ServeRenderer<Control> {
 
   dispose(): void {
     this.gpu?.dispose();
+    this.pickIndices.forEach((b) => b.destroy());
   }
 }
 

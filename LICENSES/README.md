@@ -1,6 +1,6 @@
 # Third-party licences
 
-terminal-sciviz itself is MIT-licensed (see [LICENSE](LICENSE)). It bundles two kinds of
+terminal-sciviz itself is MIT-licensed (see [LICENSE](LICENSE)). It bundles four kinds of
 third-party material, which keep their own licences:
 
 1. **Colour-map tables**: the 256-sample sRGB tables in
@@ -10,8 +10,12 @@ third-party material, which keep their own licences:
    [`font.json`](deno/assets/font.json), built by [`deno/tools/font_atlas.py`](deno/tools/font_atlas.py)
    from JetBrains Mono and STIX Two Math, whose font files ship in
    [`deno/assets/fonts/`](../deno/assets/fonts/).
+3. **The Utah teapot**: [`deno/assets/teapot.json`](../deno/assets/teapot.json), see
+   [Teapot](#teapot).
+4. **Boost.Math**: the WebAssembly build in
+   [`deno/vendor/boost-math-wasm/`](../deno/vendor/boost-math-wasm/), see [Boost.Math](#boostmath).
 
-No third-party code runs at run time. The generator fetches the npm packages
+Boost.Math is the only third-party code that runs at run time. The generator fetches the npm packages
 `d3-scale-chromatic@3.1.0`, `d3-color@3.1.0` and `d3-interpolate@3.0.1` when it is run; only the
 colour values it computes with them are committed.
 
@@ -120,6 +124,27 @@ atlas (`deno/assets/font.png`, `deno/assets/font.json`) is rendered from glyphs 
 is likewise covered by the SIL Open Font License 1.1; it is not a font and uses no Reserved Font
 Name.
 
+## Teapot
+
+`deno/assets/teapot.json` holds Martin Newell's Utah teapot (University of Utah, 1975): 32
+bicubic Bézier patches over 290 control points, in the version with Jim Blinn's vertical scaling
+(heights divided by about 1.3), z up. The numbers were copied from the `teapotPatches` and
+`teapotVertices` arrays of three.js's `examples/jsm/geometries/TeapotGeometry.js` (Eric Haines's
+conversion of his SPD data), with the patch indices kept 0-based as there and the flat arrays
+grouped per patch and per vertex. three.js is under the MIT licence ([below](threejs-MIT.txt), Copyright © 2010-2024
+three.js authors); the teapot data itself has been freely redistributed since its publication and
+carries no licence of its own. `deno/lib/surfaces.ts` reads it as 32 degree-3 × 3 NURBS patches.
+
+## Boost.Math
+
+`deno/vendor/boost-math-wasm/` is boost-math-wasm 0.4.0, an unofficial Emscripten build of
+[Boost.Math](https://www.boost.org/libs/math) from the fork <https://github.com/NAThompson/math>
+(release `boost-math-v0.4.0`), redistributed unmodified; its README there gives the source URL
+and SHA-256. `deno/lib/boost.ts` loads it to evaluate special functions, function curves and
+distribution quantiles in double precision. Boost.Math is under the Boost Software License 1.0,
+the Emscripten runtime and the musl libc parts compiled in under their MIT-style licences; all are
+in [`deno/vendor/boost-math-wasm/LICENSE`](../deno/vendor/boost-math-wasm/LICENSE).
+
 ## Licence texts
 
 - [d3-scale-chromatic (ISC) and ColorBrewer (Apache-2.0)](d3-scale-chromatic-ISC-and-ColorBrewer.txt)
@@ -130,3 +155,5 @@ Name.
 - [Viridis, Magma, Inferno, Plasma (CC0)](BIDS-colormaps-CC0.txt)
 - [Turbo (Apache-2.0)](turbo-Google.txt)
 - [Apache License 2.0](Apache-2.0.txt)
+- [three.js (MIT; teapot data)](threejs-MIT.txt)
+- [Boost.Math (BSL-1.0), Emscripten, musl](../deno/vendor/boost-math-wasm/LICENSE)

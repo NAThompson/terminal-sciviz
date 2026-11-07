@@ -47,15 +47,37 @@ SPREAD = 8  # px (at BASE) of distance encoded either side of the outline
 OVERSAMPLE = 8  # distance transform taken at BASE × OVERSAMPLE
 WEIGHT = {"regular": 0.2, "bold": 0.45}  # BASE px added to the field: stems as Menlo's
 LINE_BOX = (0.929, 0.237)  # ascent, descent (em): Menlo's, which the layouts were tuned to
-CHARS = "".join(chr(c) for c in range(32, 127)) + "·−×Δ≈…±µ–—"
-# Math: the face where it has them, else STIX Two Math (same pixel size and baseline)
-CHARS += "π≤≥∞θτωφψκλμσ→←√½∂∫ℜℑ‖∇′″𝜑𝜋𝜏𝜔𝜅𝜃𝜓𝑥𝑦𝑧𝑡𝑘𝑓𝑖𝑛𝑠𝑢𝐽𝐸𝐻𝐶𝑆𝐫𝑝𝑞𝑚𝑤𝑣𝑎𝑏𝑐𝑑𝑒𝑔𝑟𝑗𝐦𝐯𝐤"
-# Greek, upright and math italic (titles such as "Lorenz attractor (𝜎 = 10, 𝜌 = 28, 𝛽 = 8/3)")
-CHARS += "αβγδεζηικνξορςυχΓΘΛΞΠΣΦΨΩ𝛼𝛽𝛾𝛿𝜀𝜁𝜂𝜄𝜆𝜇𝜈𝜉𝜌𝜎𝜒Ω"
+# Everything plot text is likely to need: the face where it has them, else STIX Two Math (same
+# pixel size and baseline). Unicode has no sub/superscript forms of b c d f g q y z (sub) or q
+# (sup), nor of most capitals below the line.
+rng = lambda a, b, skip=(): "".join(chr(c) for c in range(a, b + 1) if c not in skip)
+CHARS = rng(32, 126)
+CHARS += rng(0xA0, 0xFF) + rng(0x100, 0x17F)  # Latin-1 and Extended-A: ° ÷ Å, names (Schrödinger, Erdős, Łojasiewicz)
+CHARS += rng(0x391, 0x3A9, {0x3A2}) + rng(0x3B1, 0x3C9) + "ϑϕϵϱϖϰ"  # Greek, upright, and its variants
+CHARS += rng(0x1D434, 0x1D467, {0x1D455}) + "ℎ"  # math italic 𝐴–𝑧 (ℎ is Planck's)
+CHARS += rng(0x1D6E2, 0x1D6FA) + rng(0x1D6FC, 0x1D714) + "𝜕𝜖𝜗𝜘𝜙𝜚𝜛"  # math italic Greek 𝛢–𝜔 and variants
+CHARS += rng(0x1D400, 0x1D433) + rng(0x1D7CE, 0x1D7D7)  # bold 𝐀–𝐳 (vectors, matrices), 𝟎–𝟗
+CHARS += rng(0x1D6A8, 0x1D6C0) + rng(0x1D6C2, 0x1D6DA)  # bold Greek
+CHARS += rng(0x1D468, 0x1D49B)  # bold italic 𝑨–𝒛
+CHARS += "ℂℍℕℙℚℝℤ𝔼𝟙𝕀𝕊𝕋"  # double-struck
+CHARS += "ℬℰℱℋℐℒℳℛℯℊℴℓ℘𝒜𝒞𝒟𝒢𝒥𝒦𝒩𝒪𝒫𝒬𝒮𝒯𝒰𝒱𝒲𝒳𝒴𝒵"  # script (Lagrangian, Hamiltonian, Fourier, 𝒪)
+CHARS += "ℜℑℭℌℨ𝔤𝔰𝔲𝔬"  # fraktur (Lie algebras)
+CHARS += ("−±∓×÷·∙∘⋅∗⋆⊗⊕⊙⊖⊘†‡√∛∜∝∞∂∇∆∫∬∭∮∑∏∐≠≈≉≃≅≡≢∼≍≪≫≤≥≲≳≺≻≼⩽⩾∈∉∋⊂⊃⊆⊇∪∩∖∅∀∃∄¬∧∨"
+          "⊥∥∦∠⊤⊢⊨∴∵≔≜≝∶⋯⋮⋱⋰…′″‴‰‱℃℉Ωℏħƛ℧Åℵ⌊⌋⌈⌉⟨⟩⟦⟧‖∣∤")  # operators, relations, units
+CHARS += "→←↑↓↔↕⇒⇐⇔⇑⇓↦↗↘↖↙⟶⟵⟹⟸⟺↪↩⇌⇄⇀↻↺⟼"  # arrows
+CHARS += "‐‑‒–—―‘’‚“”„‹›«»•◦§¶©®™№✓✗      "  # punctuation, spaces (thin: 10 000)
+CHARS += "€£¥¢₹₽" + "¼½¾⅓⅔⅛⅜⅝⅞" + "●○■□▲△▼▽◆◇★☆✕▪▫◀▶⬤◼◻◯▴▾▸◂"  # currency, fractions, legend shapes
+# Combining marks, drawn over the glyph before them (lib/overlay.ts): 𝑥̂ 𝑥̄ 𝑥̃ 𝑥̇ 𝑥̈ 𝑣⃗, ≠ by ̸
+MARKS = "̸̀́̂̃̄̆̇̈̊̌⃗⃑"
+CHARS += MARKS
 # Script glyph -> the regular glyph its synthesized and small forms are drawn from, and sub/sup
 SCRIPTS = {
-    **{s: (d, "sub") for s, d in zip("₀₁₂₃₄₅₆₇₈₉₊₋ₓₐₑₒᵢⱼ", "0123456789+-xaeoij")},
-    **{s: (d, "sup") for s, d in zip("⁰¹²³⁴⁵⁶⁷⁸⁹⁺⁻ⁱᵏⁿ", "0123456789+-ikn")},
+    **{s: (d, "sub") for s, d in zip("₀₁₂₃₄₅₆₇₈₉₊₋₌₍₎", "0123456789+-=()")},
+    **{s: (d, "sub") for s, d in zip("ₐₑₕᵢⱼₖₗₘₙₒₚᵣₛₜᵤᵥₓᵦᵧᵨᵩᵪ", "aehijklmnoprstuvxβγρφχ")},
+    **{s: (d, "sup") for s, d in zip("⁰¹²³⁴⁵⁶⁷⁸⁹⁺⁻⁼⁽⁾", "0123456789+-=()")},
+    **{s: (d, "sup") for s, d in zip("ᵃᵇᶜᵈᵉᶠᵍʰⁱʲᵏˡᵐⁿᵒᵖʳˢᵗᵘᵛʷˣʸᶻ", "abcdefghijklmnoprstuvwxyz")},
+    **{s: (d, "sup") for s, d in zip("ᴬᴮᴰᴱᴳᴴᴵᴶᴷᴸᴹᴺᴼᴾᴿᵀᵁⱽᵂ", "ABDEGHIJKLMNOPRTUVW")},
+    **{s: (d, "sup") for s, d in zip("ᵅᵝᵞᵟᵋᶿᶥᵠᵡ", "αβγδεθιφχ")},
 }
 SCRIPT_GAIN = 1.2  # × the script size
 SCRIPT_BOLD = 0.5  # BASE px added to the field (strokes 1 px thicker at BASE)
@@ -106,7 +128,7 @@ def script_sdf(path, base, kind, gain, bold):
     field, L, T = sdf(scaled, base, bold)
     dx = (face.getlength("0") - scaled.getlength(base)) / 2 / OVERSAMPLE
     dy = (zb - sb) / OVERSAMPLE
-    if base in "+-":  # signs centred on the digits (as in 10⁻³), not on the x-height
+    if base in "+-=":  # signs centred on the digits (as in 10⁻³), not on the x-height
         _, bt, _, bb = ink_box(scaled, base)
         dy += ((st + sb) - (bt + bb)) / 2 / OVERSAMPLE
     return field, L + round(dx), T + round(dy)
@@ -136,6 +158,10 @@ def main():
             else:
                 missing.append(ch)
                 continue
+            if ch in MARKS:  # ink centred on the pen, no advance: overlay.ts centres it over the glyph before
+                font = primary if ord(ch) in cmap else fallback
+                l, _, r, _ = ink_box(font, ch)
+                field, adv = (field[0], field[1] - round((l + r) / 2 / OVERSAMPLE), field[2]), 0
             glyphs.append((face, ch, *(field or (None, 0, 0)), adv))
         if missing:
             raise SystemExit(f"{face}: no font has {''.join(missing)!r}")
@@ -159,7 +185,7 @@ def main():
     height = y + shelf
     atlas = Image.new("L", (WIDTH, height), 0)
     for i, (face, ch, img, bx, by, adv) in enumerate(glyphs):
-        entry = {"advance": round(adv, 4)}
+        entry = {"advance": round(adv, 4), **({"mark": 1} if isinstance(ch, str) and ch in MARKS else {})}
         if img is not None:
             px, py = places[i]
             atlas.paste(img, (px, py))

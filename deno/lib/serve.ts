@@ -40,6 +40,7 @@
  */
 
 import { validateControl } from "./controls.ts";
+import { missingSinceFrame } from "./overlay.ts";
 import { encodePng } from "./png.ts";
 import { ControlWatcher, readStamped, setInteractiveQos, ShmFrame, shmExists, shmUnlink, statStamp } from "./sys.ts";
 
@@ -165,14 +166,24 @@ export async function renderOnce<C extends Control>(
   const start = performance.now();
   validateControl(ctl);
   const pending = await renderer.submit(ctl, 0);
+  const glyphs = takeMissing();
   const state = renderer.state(ctl, 1, null, 0);
   await pending.done;
   const frame = pending.read(alloc);
-  return { frame, state: withFrame(state, 1, frame.hover, performance.now() - start) };
+  return { frame, state: withFrame(state, 1, frame.hover, performance.now() - start, glyphs) };
 }
 
-function withFrame(state: unknown, generation: number, hover: unknown, ms: number): unknown {
-  return { ...(state as object), generation, hover, renderMs: Math.round(ms * 1000) / 1000 };
+/** Characters the font atlas lacked (drawn as "?") since the last call: taken right after a
+ * submit, they belong to that frame (several can be in flight), whose state reports them. */
+function takeMissing(): string {
+  const s = [...missingSinceFrame].join("");
+  missingSinceFrame.clear();
+  return s;
+}
+
+function withFrame(state: unknown, generation: number, hover: unknown, ms: number, glyphs = ""): unknown {
+  const missing = glyphs ? { missingGlyphs: glyphs } : {};
+  return { ...(state as object), ...missing, generation, hover, renderMs: Math.round(ms * 1000) / 1000 };
 }
 
 async function cmdPng<C extends Control>(tool: Tool<C>, control: string, output: string): Promise<void> {
@@ -207,6 +218,7 @@ interface Flight<C> {
   start: number;
   pending: Pending;
   state: unknown;
+  glyphs: string; // characters the font lacked, met while submitting this frame
   ready: Promise<void>; // `pending.done` settled (never rejects)
   settled: boolean;
   error?: unknown;
@@ -284,7 +296,7 @@ async function cmdServe<C extends Control>(
       if (ctl.frameFile) {
         writeAtomic(`${outdir}/frame.rgba`, frame.rgba);
       }
-      const state = withFrame(flight.state, generation, frame.hover, now - flight.start);
+      const state = withFrame(flight.state, generation, frame.hover, now - flight.start, flight.glyphs);
       writeAtomic(`${outdir}/state.json`, encoder.encode(JSON.stringify(state)));
       outstanding.push({ name, time: now });
       sweep(now);
@@ -392,6 +404,7 @@ async function cmdServe<C extends Control>(
           rev: rev ?? 0,
           start,
           pending,
+          glyphs: takeMissing(),
           state: renderer.state(ctl, 0, null, 0),
           settled: false,
           ready: undefined!,

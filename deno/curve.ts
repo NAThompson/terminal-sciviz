@@ -35,7 +35,7 @@ import { DRAW_WGSL as CURVE3D_WGSL, NurbsCurve3DGpuRenderer } from "./lib/gpu_cu
 import { DEPTH_FORMAT, getTargets, type RenderTargets, SAMPLE_COUNT } from "./lib/gpu_surface.ts";
 import { BitmapFont, type FontSize, FRAME_FORMAT, OverlayRenderer, premul, Quads, type Rgba, rootSlider, type RootSlider, rootSliderHeight } from "./lib/overlay.ts";
 import { main, type Pending, type Renderer as ServeRenderer } from "./lib/serve.ts";
-import { CURVES, fnSampler } from "./lib/generators.ts";
+import { CURVES, curvePoints } from "./lib/generators.ts";
 
 const BLUE = "#3987e5", ORANGE = "#d95926", MAGENTA = "#d55181";
 const INK = "#c9d1d9", INK2 = "#8b949e", GRID = "#262c36", ZERO = "#484f58", SURFACE = "#101216", HOVER_RING = "#e6edf3";
@@ -65,7 +65,8 @@ export const DEFAULTS = {
   params: null as number[] | null, // of the polyline's points (default: their indices)
   controlPolygon: false,
   color: BLUE, // 2D
-  lineWidth: 2, // CSS px
+  lineWidth: 2, // CSS px (2D and 3D: on screen, whatever the depth)
+  lineCap: "square" as "square" | "round", // 3D: round joins and caps (each chord a capsule), for thick lines
   // 3D colour: by `u`, or by values at the polyline's points (cyclic: wrapped into the domain, e.g. phase)
   colorBy: "u" as "u" | { values: number[]; label?: string; domain?: [number, number]; ticks?: "pi"; cyclic?: boolean } | null,
   aspect: null as [number, number, number] | null, // 3D: world scale of each axis (shown values unscaled)
@@ -136,13 +137,13 @@ export function expandOde(ctl: Control): Control {
   return { ...ctl, ...out };
 }
 
-/** A parametric curve of lib/generators.ts, evaluated on the GPU (f32) so controls stay small:
+/** A parametric curve of lib/generators.ts, evaluated here (f64) so controls stay small:
  * `{name: "trefoil" | "chirp", n, t: [t0, t1], ...its parameters}`. Expanded into polyline,
  * params (t) and the colour values (curvature, phase), `colorBy`'s other fields (label, domain,
  * ticks, cyclic) kept from the control. */
 export type GenSpec = { name: string; n?: number; t?: [number, number] } & Record<string, unknown>;
 const genCache = new Map<string, Pick<Control, "polyline" | "params"> & { values: number[] }>();
-export async function expandGen(device: GPUDevice, ctl: Control): Promise<Control> {
+export function expandGen(ctl: Control): Control {
   const gen = ctl.gen as GenSpec | undefined;
   if (!gen) return ctl;
   const c = CURVES[gen.name];
@@ -154,7 +155,7 @@ export async function expandGen(device: GPUDevice, ctl: Control): Promise<Contro
     const t = (gen.t ?? c.t).map(Number) as [number, number];
     if (!(n >= 2 && n <= 1_000_000) || !(t[1] > t[0])) throw new Error("gen: need 2 <= n <= 1e6 and t increasing");
     const args = c.args.map((a, i) => (gen[a] === undefined ? c.defaults[i] : Number(gen[a])));
-    const pts = await fnSampler(device).curve(gen.name, n, t, args);
+    const pts = curvePoints(gen.name, n, t, args);
     out = {
       polyline: Array.from({ length: n }, (_, i) => [pts[i * 4], pts[i * 4 + 1], pts[i * 4 + 2]]),
       params: Array.from({ length: n }, (_, i) => t[0] + ((t[1] - t[0]) * i) / (n - 1)),
@@ -225,9 +226,10 @@ const srgbToLinear = (c: number) => (c <= 0.04045 ? c / 12.92 : ((c + 0.055) / 1
  * shader. The curve's parameter is the (unwrapped) value itself, `uRange` its domain. */
 const WRAP_WGSL = /* wgsl */ `
   @fragment
-  fn fragmentWrapped(in: Varyings) -> @location(0) vec4f {
+  fn fragmentWrapped(in: Varyings) -> Fragment {
+    let mask = capsuleMask(in);
     let r = (in.u - view.uRange.x) / (view.uRange.y - view.uRange.x);
-    return vec4f(toSrgb(getColor(r - floor(r))), 1.0);
+    return Fragment(vec4f(toSrgb(getColor(r - floor(r))), 1.0), mask);
   }
 `;
 
@@ -270,7 +272,7 @@ class WrappedCurve3D {
 
   /** Draws all runs into `canvas` (cleared) with the view of the renderer's `draw`, `domain` the
    * colour map's (one period). */
-  draw(canvas: TextureTarget, viewProjection: number[], near: number, size: [number, number], width: number, domain: [number, number]): void {
+  draw(canvas: TextureTarget, viewProjection: number[], near: number, size: [number, number], width: number, domain: [number, number], round = false): void {
     const { device } = this;
     this.targets = getTargets(device, FRAME_FORMAT, size, this.targets);
     for (const run of this.runs) {
@@ -278,7 +280,7 @@ class WrappedCurve3D {
       const counts = getSegmentCounts({ ...run.curve, dims: 2, points: [...points], weights: [...weights] }, getKnotSpans(run.curve), [1, 1]);
       run.renderer.setSegmentCounts(counts);
       device.queue.writeBuffer(run.renderer.view, 0, Float32Array.from([
-        ...viewProjection, size[0] / 2, size[1] / 2, ...getGpuParams(run.curve, domain), width, 0, 0, 0,
+        ...viewProjection, size[0] / 2, size[1] / 2, ...getGpuParams(run.curve, domain), width, round ? 1 : 0, 0, 0,
       ])); // as `NurbsCurve3DGpuRenderer.draw`
     }
     const encoder = device.createCommandEncoder();
@@ -606,21 +608,22 @@ export class CurvePlot implements ServeRenderer<Control> {
     const vp = mul4(toRect, mul4(projection, lookAtView(eye, this.target, [0, 0, 1])));
     this.viewProjection = vp;
     this.content = screenRect(this.fitPoints, vp, w, h);
-    const draw = (r: NurbsCurve3DGpuRenderer, c: NurbsCurve, canvas: TextureTarget, width: number) => {
+    const round = ctl.lineCap === "round";
+    const draw = (r: NurbsCurve3DGpuRenderer, c: NurbsCurve, canvas: TextureTarget, width: number, round = false) => {
       canvas.width = w;
       canvas.height = h;
       const { points, weights } = projectControlPoints(c, vp, [w, h], near);
       const counts = getSegmentCounts({ ...c, dims: 2, points: [...points], weights: [...weights] }, getKnotSpans(c), [1, 1]);
       r.setSegmentCounts(counts);
-      r.draw({ viewProjection: this.viewProjection, uRange: this.uRange, width, size: [w, h] });
+      r.draw({ viewProjection: this.viewProjection, uRange: this.uRange, width, round, size: [w, h] });
     };
     if (this.p3) draw(this.p3, this.polygon!, this.canvas3[0], 1.5 * s);
     if (this.wrapped) {
       this.canvas3[1].width = w;
       this.canvas3[1].height = h;
-      this.wrapped.draw(this.canvas3[1], this.viewProjection, near, [w, h], ctl.lineWidth * s, this.barDomain);
+      this.wrapped.draw(this.canvas3[1], this.viewProjection, near, [w, h], ctl.lineWidth * s, this.barDomain, round);
     } else {
-      draw(this.r3!, this.curve, this.canvas3[1], ctl.lineWidth * s);
+      draw(this.r3!, this.curve, this.canvas3[1], ctl.lineWidth * s, round);
     }
 
     const q = new Quads(this.font);
@@ -740,7 +743,7 @@ export class CurvePlot implements ServeRenderer<Control> {
   // Frame ------------------------------------------------------------------------------------------
 
   async submit(ctl: Control, slot: number): Promise<Pending> {
-    ctl = expandOde(await expandGen(this.device, ctl));
+    ctl = expandOde(expandGen(ctl));
     const { device } = this;
     this.setData(ctl);
     const w = Math.trunc(ctl.width);
@@ -749,7 +752,7 @@ export class CurvePlot implements ServeRenderer<Control> {
     this.scale = s;
     this.size = [w, h];
     const key = JSON.stringify([this.dataKey, w, h, ctl.azimuth, ctl.elevation, ctl.zoom, ctl.x0, ctl.x1, ctl.ymin, ctl.ymax,
-      ctl.title, ctl.subtitle, ctl.color, ctl.lineWidth, ctl.colorLabel]);
+      ctl.title, ctl.subtitle, ctl.color, ctl.lineWidth, ctl.lineCap, ctl.colorLabel]);
     if (key !== this.frameKey) {
       if (this.is3D) this.frame3D(ctl, w, h, s);
       else this.frame2D(ctl, w, h, s);

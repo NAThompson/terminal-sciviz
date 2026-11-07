@@ -255,9 +255,19 @@ const EVALUATE_WGSL = /* wgsl */ `
     let v1 = knots[params.knotsV + kv + 1u];
 
     var point = evaluate(ku, kv, mix(u0, u1, fu), mix(v0, v1, fv));
-    if (all(point.normal == vec3f(0.0))) {
-      let nudged = mix(vec2f(fu, fv), vec2f(0.5), NUDGE);
-      point.normal = evaluate(ku, kv, mix(u0, u1, nudged.x), mix(v0, v1, nudged.y)).normal;
+    if (all(point.normal == vec3f(0.0))) { // e.g. a pole or a collapsed edge: from just inside
+      var nudge = NUDGE;
+      var inside = evaluate(ku, kv, mix(u0, u1, mix(fu, 0.5, nudge)), mix(v0, v1, mix(fv, 0.5, nudge)));
+      point.normal = inside.normal;
+      // Curvature, gradient: undefined at the point itself, and its metric still flat (f32) as
+      // close as the normal is found if the collapse is of second order
+      for (var k = 0; k < 3 && point.value.y == 0.0; k++) { // 1e-3, 1e-2, 1e-1 of the span
+        if (k > 0) {
+          nudge *= 10.0;
+          inside = evaluate(ku, kv, mix(u0, u1, mix(fu, 0.5, nudge)), mix(v0, v1, mix(fv, 0.5, nudge)));
+        }
+        point.value = inside.value;
+      }
     }
 
     vertices[i] = Vertex(

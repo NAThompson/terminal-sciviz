@@ -1,6 +1,8 @@
-/** Sample surfaces (torus, sphere, `wave`, `wave-test`, `dini`, `breather`), as `NurbsSurface`s. Data only. */
+/** Sample surfaces (torus, sphere, `wave`, `wave-test`, `dini`, `breather`, and the multi-patch
+ * `teapot`), as `NurbsSurface`s. Data only. */
 
 import { findSpan, getBasisFunctions, type NurbsSurface } from "./nurbs.ts";
+import TEAPOT from "../assets/teapot.json" with { type: "json" };
 
 const S = Math.sqrt(0.5);
 const CIRCLE = [[1, 0], [1, 1], [0, 1], [-1, 1], [-1, 0], [-1, -1], [0, -1], [1, -1], [1, 0]];
@@ -150,11 +152,28 @@ function breather(): NurbsSurface {
   });
 }
 
-export const SURFACES: Record<string, () => NurbsSurface> = {
+/** The Utah teapot, exactly: Newell's 32 bicubic Bézier patches (deno/assets/teapot.json, z up,
+ * as Blinn scaled it), each a degree 3 × 3 NURBS with knots [0,0,0,0,1,1,1,1] and unit weights.
+ * Only C0/G1 across seams, with collapsed rows at the lid's knob and the bottom's centre (normals
+ * there from a nudge, cf. gpu_surface.ts). */
+function teapot(): NurbsSurface[] {
+  const bezier = [0, 0, 0, 0, 1, 1, 1, 1];
+  return TEAPOT.patches.map((patch) => ({
+    degrees: [3, 3] as [number, number],
+    shape: [4, 4] as [number, number],
+    points: patch.flatMap((i) => TEAPOT.vertices[i]), // row r (u), column c (v) at r * 4 + c
+    weights: Array(16).fill(1),
+    knots: [bezier, bezier],
+  }));
+}
+
+/** By name: one patch, or several drawn together (`teapot`). */
+export const SURFACES: Record<string, () => NurbsSurface | NurbsSurface[]> = {
   wave,
   torus,
   sphere,
   "wave-test": waveTest,
   dini,
   breather,
+  teapot,
 };

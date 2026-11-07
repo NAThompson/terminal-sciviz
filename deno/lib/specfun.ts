@@ -1,15 +1,5 @@
-/** Special functions for the gallery's data (Bessel J_n, Fresnel integrals, ...), computed by
- * simple quadrature in f64, and a seeded normal generator for its noisy series. */
-
-/** `bessel_j`: J_n(x) = 1/2π ∫ cos(nτ − x sin τ) dτ, trapezoid over a period (256 points). */
-export function besselJ(n: number, x: number): number {
-  let s = 0;
-  for (let k = 0; k < 256; k += 1) {
-    const tau = (2 * Math.PI * k) / 256;
-    s += Math.cos(n * tau - x * Math.sin(tau));
-  }
-  return s / 256;
-}
+/** Data helpers of the gallery: the Fresnel integrals (Boost.Math, lib/boost.ts, has none), by
+ * quadrature in f64, and a seeded normal generator for its noisy series. */
 
 /** `fresnel`: C(t) + i S(t) = ∫₀ᵗ exp(iπs²/2) ds by cumulative trapezoid (200 001 points on
  * [0, max |t|]), interpolated linearly. Returns [re, im] arrays. */

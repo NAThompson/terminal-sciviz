@@ -9,7 +9,7 @@ const WORKGROUP_SIZE = 64;
 // `GPUBufferUsage` and `GPUTextureUsage` flags
 const MAP_READ = 0x01;
 export const COPY_SRC = 0x04;
-const COPY_DST = 0x08;
+export const COPY_DST = 0x08;
 export const UNIFORM = 0x40;
 export const STORAGE = 0x80;
 const COPY_SRC_TEXTURE = 0x01;

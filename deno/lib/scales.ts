@@ -417,6 +417,7 @@ export interface AxisSpec {
   threshold?: number; // symlog constant
   ticks?: AxisTicks; // π multiples, or the values are logarithms (value transform)
   index?: boolean; // integer ticks (an index axis)
+  categories?: string[]; // ticks at 0, 1, ... labelled with these (box-plot groups, grouped bars)
 }
 
 export interface Tick {
@@ -461,10 +462,14 @@ function axisFormatter(domain: Domain, length: number, scale: AxisScale): (v: nu
  * a threshold), else the scale's ticks; labels with the digits that tell adjacent ticks apart,
  * all with powers of 10 if one needs it.
  */
+const LOG_CHAR_PX = 7, LOG_LABEL_GAP = 10; // CSS px of a tick label's character (11 px mono), and between labels
+
 export function axisTicks(spec: AxisSpec, lo: number, hi: number, cssLength: number): Tick[] {
   const scale = spec.scale ?? "linear";
   const domain: Domain = [lo, hi];
   const count = tickCount(cssLength);
+  const cats = spec.categories;
+  if (cats?.length) return integerTicks(domain, count).filter((v) => v >= 0 && v < cats.length).map((v) => ({ value: v, world: v, label: String(cats[v]) }));
   const transform = spec.ticks === "pi" ? undefined : spec.ticks;
   let values: number[];
   let format: (v: number, precision?: number, powers?: boolean) => string;
@@ -492,7 +497,20 @@ export function axisTicks(spec: AxisSpec, lo: number, hi: number, cssLength: num
   const precision = tickPrecision(values);
   const powers = values.some((v) => !isPlainNumber(v, precision));
   const { fwd } = axisTransform(spec);
-  return values
-    .filter((v) => v >= Math.min(lo, hi) - 1e-12 * Math.abs(hi - lo) && v <= Math.max(lo, hi) + 1e-12 * Math.abs(hi - lo))
-    .map((value) => ({ value, world: fwd(value), label: format(value, precision, powers) }));
+  // Log minor ticks (k × 10ⁿ): label all leading digits, else 1 2 5, else the powers alone,
+  // whichever first leaves no two neighbouring labels overlapping (they crowd below each power:
+  // 0.8 0.9 1 are 0.05 decade apart); the rest stay unlabelled grid lines
+  const kept = values.filter((v) => v >= Math.min(lo, hi) - 1e-12 * Math.abs(hi - lo) && v <= Math.max(lo, hi) + 1e-12 * Math.abs(hi - lo));
+  const digit = (v: number) => Math.round(Math.abs(v) / pow10(Math.floor(Math.log10(Math.abs(v)) + 1e-9)));
+  let shown: number[] | null = null;
+  if (scale === "log" && !spec.ticks && kept.some((v) => digit(v) !== 1)) {
+    const span = Math.abs(Math.log10(Math.abs(hi / lo)));
+    const at = (v: number) => (cssLength * Math.abs(Math.log10(Math.abs(v / lo)))) / span;
+    const fits = (digits: number[] | null) => {
+      const labelled = kept.filter((v) => !digits || digits.includes(digit(v)));
+      return labelled.every((v, k) => k === 0 || at(v) - at(labelled[k - 1]) >= LOG_LABEL_GAP + LOG_CHAR_PX * (format(v, precision, powers).length + format(labelled[k - 1], precision, powers).length) / 2);
+    };
+    shown = fits(null) ? null : fits([1, 2, 5]) ? [1, 2, 5] : [1];
+  }
+  return kept.map((value) => ({ value, world: fwd(value), label: shown && !shown.includes(digit(value)) ? "" : format(value, precision, powers) }));
 }

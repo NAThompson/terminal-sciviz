@@ -144,7 +144,7 @@ export function premul(hex: string, alpha = 1): Rgba {
 
 /** A glyph of the atlas at its base size: advance, and the field's rectangle in the atlas
  * (texels = base px) with its offset from the pen on the baseline. */
-interface Glyph { advance: number; x?: number; y?: number; w?: number; h?: number; bx?: number; by?: number }
+interface Glyph { advance: number; mark?: number; x?: number; y?: number; w?: number; h?: number; bx?: number; by?: number }
 /** A face at `size` px: `scale` screen px per atlas texel; metrics in px, glyphs at the base size. */
 export interface FontSize { size: number; scale: number; ascent: number; descent: number; glyphs: Record<string, Glyph> }
 interface FaceFile { size: number; ascent: number; descent: number; glyphs: Record<string, Glyph>; small?: Record<string, Glyph> }
@@ -159,8 +159,23 @@ export class BitmapFont {
 
   static async load(dir: URL): Promise<BitmapFont> {
     const file = JSON.parse(await Deno.readTextFile(new URL("font.json", dir))) as FontFile;
-    const { rgba } = await decodePng(await Deno.readFile(new URL("font.png", dir)));
-    return new BitmapFont(file, Uint8Array.from({ length: rgba.length / 4 }, (_, i) => rgba[i * 4]));
+    const png = new URL("font.png", dir);
+    // The decoded field, cached raw (decoding the ~1000-glyph atlas costs ~0.3 s a start)
+    const { mtime, size } = await Deno.stat(png);
+    const cache = `${Deno.env.get("HOME") ?? "/tmp"}/.cache/terminal-sciviz/font-${size}-${mtime?.getTime()}.r8`;
+    try {
+      const field = await Deno.readFile(cache);
+      if (field.length === file.width * file.height) return new BitmapFont(file, field);
+    } catch { /* not cached yet */ }
+    const { rgba } = await decodePng(await Deno.readFile(png));
+    const field = new Uint8Array(rgba.length / 4);
+    for (let i = 0; i < field.length; i += 1) field[i] = rgba[i * 4];
+    try {
+      await Deno.mkdir(cache.slice(0, cache.lastIndexOf("/")), { recursive: true });
+      await Deno.writeFile(`${cache}.${Deno.pid}`, field);
+      await Deno.rename(`${cache}.${Deno.pid}`, cache); // whole, for renderers starting alongside
+    } catch { /* read-only: decode each time */ }
+    return new BitmapFont(file, field);
   }
 
   get width(): number {
@@ -244,11 +259,13 @@ function glyphCoverage(d: number, k: number): number {
 }
 
 /** Characters not in the atlas, drawn as "?" (each logged once): the gallery fails on any. */
-export const missingGlyphs = new Set<string>();
+export const missingGlyphs = new Set<string>(); // ever, in this process (the gallery's check)
+export const missingSinceFrame = new Set<string>(); // since serve.ts last reported a frame's state
 
 function glyphOf(font: FontSize, ch: string): Glyph {
   const g = font.glyphs[ch];
   if (g) return g;
+  missingSinceFrame.add(ch);
   if (!missingGlyphs.has(ch)) {
     missingGlyphs.add(ch);
     console.error(`overlay: no glyph for ${JSON.stringify(ch)} (U+${ch.codePointAt(0)!.toString(16).toUpperCase()}), drawn as "?"`);
@@ -261,13 +278,22 @@ function glyphQuads(font: FontSize, text: string): { rect: number[]; uv: number[
   const out: { rect: number[]; uv: number[] }[] = [];
   const k = font.scale;
   let pen = 0;
+  let prev: Glyph | undefined;
+  const xTop = font.glyphs.x.by!; // marks sit above lowercase; over taller glyphs, raised as much
   for (const ch of text) {
     const g = glyphOf(font, ch);
+    if (g.w && g.mark && prev) { // combining: centred over the glyph before (its pen still ahead)
+      const x = Math.round(pen - (prev.advance * k) / 2);
+      const raise = prev.w && ch !== "\u0338" ? Math.min(0, prev.by! - xTop) * k : 0; // (a slash through: not)
+      out.push({ rect: [x + g.bx! * k, g.by! * k + raise, g.w * k, g.h! * k], uv: [g.x!, g.y!, g.w, g.h!] });
+      continue;
+    }
     if (g.w) {
       const x = Math.round(pen); // whole pixels: crisp stems, every instance of a glyph alike
       out.push({ rect: [x + g.bx! * k, g.by! * k, g.w * k, g.h! * k], uv: [g.x!, g.y!, g.w, g.h!] });
     }
     pen += g.advance * k;
+    prev = g;
   }
   return out;
 }

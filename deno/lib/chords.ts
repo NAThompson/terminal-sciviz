@@ -1,6 +1,6 @@
 /**
  * Polyline of samples already on the GPU (`x, y, z, u` per sample, relative to an origin, as
- * lib/generators.ts writes them), drawn as chords of constant width on screen into a texture,
+ * line.ts uploads them), drawn as chords of constant width on screen into a texture,
  * blended `over` what is there (premultiplied). The draw shader is that of the NURBS line
  * renderer (`NurbsGpuRenderer`, lib/gpu_line.ts), unchanged, so these match its curves.
  */
@@ -26,8 +26,13 @@ const DRAW_WGSL = /* wgsl */ `
 
   @vertex
   fn vertexMain(@builtin(vertex_index) v: u32, @builtin(instance_index) chord: u32) -> Varyings {
-    let a = samples[chord].xy * view.scale + view.offset;
-    let b = samples[chord + 1u].xy * view.scale + view.offset;
+    let pa = samples[chord].xy;
+    let pb = samples[chord + 1u].xy;
+    // a NaN or infinite end (a pole, outside the domain): no chord, a gap; huge finite ends are
+    // clamped on screen, so the chord leaves the plot steeply instead of overflowing
+    let finite = all(abs(vec4f(pa, pb)) < vec4f(3.4e38));
+    let a = clamp(pa * view.scale + view.offset, vec2f(-1e7), vec2f(1e7));
+    let b = clamp(pb * view.scale + view.offset, vec2f(-1e7), vec2f(1e7));
     let len = length(b - a);
     let dir = select(vec2f(1.0, 0.0), (b - a) / len, len > 1e-6);
     let normal = vec2f(-dir.y, dir.x);
@@ -39,7 +44,7 @@ const DRAW_WGSL = /* wgsl */ `
     let along = mix(a - dir * half, b + dir * half, ends[v]);
 
     var out: Varyings;
-    out.position = vec4f((along + normal * half * sides[v]) / view.halfSize, 0.0, 1.0);
+    out.position = select(vec4f(2.0, 2.0, 0.0, 1.0), vec4f((along + normal * half * sides[v]) / view.halfSize, 0.0, 1.0), finite);
     out.across = half * sides[v];
     return out;
   }

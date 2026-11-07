@@ -53,19 +53,23 @@ function cellSize(s: Shown, viewport?: { columns: number; rows: number }) {
 // is saved. Writes are coalesced (the renderer retries a torn file and ignores stale revs).
 // The newest view (a tool result or a /sciviz output) is live: frames are blitted into it and a
 // transparent Client over it takes the pointer and keys. Older views freeze on the PNG of their
-// last settled frame (`${RUN}/views/<id>.png`).
+// last settled frame (`${VIEWS}/<id>.png`).
 const VIEW_TOOL = 'mcp__sciviz__view'
 const PLOT_TOOL = 'mcp__sciviz__plot'
 const OPEN_TOOL = 'mcp__sciviz__gallery_open'
+const CHART_TOOL = 'mcp__sciviz__chart'
+const CHART_KEYS = ['title', 'subtitle', 'xlabel', 'ylabel', 'x', 'y', 'series', 'marks', 'color', 'r', 'overlays', 'legend', 'x0', 'x1', 'ymin', 'ymax']
 // Resolved at session start (resolvePaths): ROOT holds deno/ (the plugin's own folder once installed,
 // or the projectDir option); RUN is per-user state (control files, frames, snapshots).
 let ROOT = ''
 let RUN = ''
+let VIEWS = ''
+let ACTIVE = '' // touched while the session is used (the 30-day prune) // the session's frozen views (shared by its processes); RUN: this process's controls and frames
 let DENO = '' // absolute path, or '' when none was found
 const MAX_FRAME_PX = 4096 // ImageSource limit for shm/file frames
 const DRAG_SCALE = 0.55 // resolution while dragging (faster frames); full Retina again on release
 const VIEW_ASPECT = 16 / 10 // pixels, width / height
-const SURFACES = ['wave', 'torus', 'sphere', 'dini', 'breather', 'wave-test']
+const SURFACES = ['wave', 'torus', 'sphere', 'dini', 'breather', 'teapot', 'wave-test']
 const COLORMAPS = ['viridis', 'magma', 'inferno', 'plasma']
 const COLOR_BY = ['field', 'height', 'gaussian-curvature', 'mean-curvature']
 const FUNCTIONS = ['bumps', 'runge', 'step', 'blocks']
@@ -127,7 +131,7 @@ const view = { live: '', liveMinRev: 0, intended: '', cols: 80, rows: 25, pxW: 9
   drag: null as null | { x: number; y: number; ctl: Ctl; win: Win | null; zooming: boolean } }
 
 const cycle = (list: string[], cur: string) => list[(list.indexOf(cur) + 1) % list.length]
-const viewPng = (id: string) => `${RUN}/views/${id.replace(/[^A-Za-z0-9_-]/g, '_')}.png`
+const viewPng = (id: string) => `${VIEWS}/${id.replace(/[^A-Za-z0-9_-]/g, '_')}.png`
 const liveKind = (): Kind | undefined => kindOf[view.live]
 const legacyInteraction = (kind: Kind): Interaction => (kind === 'surface' ? 'orbit' : 'pan-zoom-x')
 
@@ -157,9 +161,11 @@ async function writeControl($: any, kind: Kind) {
 const nextRev = (kind: Kind) => Math.max(revs[kind] ?? 0, KINDS[kind].ctl.rev ?? 0) + 1
 
 /** Save the live view's frame for the next rev as its PNG (what it freezes on, what Claude reads). */
+let touchedAt = 0
 async function settle($: any, id = view.live) {
   const kind = kindOf[id]
   if (!kind) return
+  if (ACTIVE && Date.now() - touchedAt > 3600e3) { touchedAt = Date.now(); void $.process.run(['/usr/bin/touch', ACTIVE]).catch(() => {}) } // in use: not pruned
   const ctl = KINDS[kind].ctl
   ctl.snapshot = { path: viewPng(id), rev: nextRev(kind) } // the rev writeControl is about to assign
   await writeControl($, kind)
@@ -219,7 +225,7 @@ async function startRenderer($: any, kind: Kind) {
   delete lastError[kind]
   void (async () => {
     try {
-      await $.process.run(['/bin/mkdir', '-p', dir(kind), `${RUN}/views`])
+      await $.process.run(['/bin/mkdir', '-p', dir(kind), VIEWS])
       KINDS[kind].ctl.quit = false
       await writeControl($, kind)
       const argv = [DENO, 'run', '-A', '--unstable-webgpu', '--unstable-ffi', KINDS[kind].script, 'serve',
@@ -350,12 +356,20 @@ async function drawView($: any, e: any, id: string, kind: Kind) {
   if (running[kind]) void writeControl($, kind)
   // input only over the object (3D views): presses on the empty frame around it select transcript text
   const inRect = view.input && view.input.cols === cols && view.input.rows === rows ? view.input.rect : [0, 0, cols, rows]
+  // a line of the controls the user has likely forgotten; none: no line, no space
+  void $.store.get('hints').catch(() => null) // subscribes this draw: a practised() write redraws it
+  const hints = hintLine(kind, await hintMemory($))
   return (
     <Box width={cols} height={rows}>
       <Image key="view" source={source} columns={cols} rows={rows} alt={setupError || lastError[kind] ? `sciviz: ${setupError || lastError[kind]}` : 'sciviz: starting the GPU renderer…'} />
       <Box position="absolute" top={inRect[1]} left={inRect[0]}>
         <Client key="input" module="./input.tsx" width={inRect[2]} height={inRect[3]} />
       </Box>
+      {hints ? ( // in the view's top row, right-aligned (by the title): no row of its own below it
+        <Box position="absolute" top={0} left={Math.max(0, cols - hints.length - 1)}>
+          <Text dimColor>{hints}</Text>
+        </Box>
+      ) : null}
     </Box>
   )
 }
@@ -399,7 +413,45 @@ function writeWindow(kind: Kind, win: Win, x: [number, number], y: [number, numb
 /** Zoom an axis range by f about axis value `at`. */
 const zoomRange = ([a, b]: [number, number], at: number, f: number): [number, number] => [at - (at - a) * f, at + (b - at) * f]
 
+// ---- control hints, spaced like a forgetting curve: retention e^(-t/S) since a control's last use;
+// a hint shows once it falls below 1/2 (never used: shown), and each use spaced a minute or more
+// from the last doubles S (10 min, 20, 40, ... a month). Kept across sessions in $.store ----
+type Memory = { last: number; s: number } // ms since the epoch; strength, ms
+const HINT_S0 = 10 * 60e3, HINT_SMAX = 30 * 86400e3, HINT_SPACING = 60e3
+let hintLoad: Promise<Record<string, Memory>> | null = null // one load, shared: concurrent first uses edit one object
+const hintMemory = ($: any): Promise<Record<string, Memory>> =>
+  (hintLoad ??= ($.store.get('hints') as Promise<Record<string, Memory> | undefined>).then((m) => m ?? {}, () => ({})))
+let hintWrite = false
+async function practised($: any, id: string) {
+  const m = await hintMemory($), now = Date.now(), cur = m[id] // loaded first: never overwrite saved strengths with {}
+  if (cur && now - cur.last < HINT_SPACING) cur.last = now // massed practice: no stronger, but remembered
+  else m[id] = cur ? { last: now, s: Math.min(HINT_SMAX, cur.s * 2) } : { last: now, s: HINT_S0 }
+  if (hintWrite) return
+  hintWrite = true // one write per 2 s at most (it redraws the live view, whose draw read the store)
+  await $.clock.sleep(cur ? 2000 : 0)
+  hintWrite = false
+  await $.store.set('hints', m).catch(() => {})
+}
+const hintDue = (m: Memory | undefined, now: number) => !m || Math.exp(-(now - m.last) / m.s) < 0.5
+const KEY_HINT: Record<string, string> = { c: 'colors', C: 'colors', i: 'invert', r: 'reset', '+': 'zoom', '-': 'zoom', '=': 'zoom', s: 'surface', b: 'colorBy', p: 'play', ' ': 'play' }
+/** The due hints of the live view, as one line ('' when none is due). */
+function hintLine(kind: Kind, mem: Record<string, Memory>): string {
+  const ctl = KINDS[kind]?.ctl ?? {}, info = viewInfo[view.live]
+  const orbit = (info?.interaction ?? legacyInteraction(kind)) === 'orbit'
+  const maps = ('colormap' in ctl || 'phaseColorMap' in ctl) && kind !== 'pchip'
+  const all: [string, string][] = [
+    ['drag', orbit ? 'drag orbit' : 'drag pan'], ['zoom', 'shift-drag or +/- zoom'],
+    ...(maps ? [['colors', 'c colours'], ['invert', 'i invert']] as [string, string][] : []),
+    ...(kind === 'surface' ? [['surface', 's surface'], ['colorBy', 'b colour by']] as [string, string][] : []),
+    ...(info?.entry?.playback ? [['play', 'space pause']] as [string, string][] : []),
+    ['reset', 'r reset'],
+  ]
+  const now = Date.now()
+  return all.filter(([id]) => hintDue(mem[id], now)).map(([, text]) => text).join(' · ')
+}
+
 async function onKey($: any, kind: Kind, k: string) {
+  if (KEY_HINT[k]) void practised($, KEY_HINT[k])
   const ctl = KINDS[kind].ctl
   const info = viewInfo[view.live]
   const interaction = info?.interaction ?? legacyInteraction(kind)
@@ -487,11 +539,15 @@ async function refreshInputRect($: any, kind: Kind) {
   try { st = JSON.parse(await $.fs.read(`${dir(kind)}/state.json`)) } catch { return }
   const { cols, rows } = view
   let rect: number[] | null = null
-  if (Array.isArray(st?.content) && st.width > 0 && st.height > 0) {
-    const boxes = [st.content, ...(Array.isArray(st.rootSlider?.rect) ? [st.rootSlider.rect] : [])]
+  const content = st?.content ?? st?.plotRect // 3D: the object's box; 2D: the plot area (pan, zoom, hover)
+  if (Array.isArray(content) && st.width > 0 && st.height > 0) {
+    const boxes = [content, ...(Array.isArray(st.rootSlider?.rect) ? [st.rootSlider.rect] : [])]
     const [x0, y0, x1, y1] = boxes.reduce((a: number[], b: number[]) => [Math.min(a[0], b[0]), Math.min(a[1], b[1]), Math.max(a[2], b[2]), Math.max(a[3], b[3])])
     const cx0 = Math.max(0, Math.floor((x0 / st.width) * cols) - 1), cy0 = Math.max(0, Math.floor((y0 / st.height) * rows) - 1)
-    const cx1 = Math.min(cols, Math.ceil((x1 / st.width) * cols) + 1), cy1 = Math.min(rows, Math.ceil((y1 / st.height) * rows) + 1)
+    // no slack below: what follows the view on screen can start above its laid-out bottom rows
+    // a row clear of the view's bottom too: on screen the view can end above its laid-out rows,
+    // and what follows it (text to select) is drawn there
+    const cx1 = Math.min(cols, Math.ceil((x1 / st.width) * cols) + 1), cy1 = Math.min(rows - 2, Math.floor((y1 / st.height) * rows))
     if (cx1 > cx0 && cy1 > cy0) rect = [cx0, cy0, cx1 - cx0, cy1 - cy0]
   }
   const was = view.input?.rect?.join(',') ?? ''
@@ -561,6 +617,7 @@ async function onPointer($: any, kind: Kind, ev: any) {
       ctl.fitAt ??= [ctl.azimuth, ctl.elevation]
     }
     view.drag = { x, y, ctl: { ...ctl }, win, zooming: !!ev.shift }
+    void practised($, ev.shift ? 'zoom' : 'drag')
     ctl.hover = null
     // lower resolution while orbiting (3D frames cost most); 2D keeps its layout so pan/zoom stay anchored
     // while orbiting: fewer pixels, and renderers that support it (volume.ts) cut their ray-march samples
@@ -768,9 +825,21 @@ async function resolvePaths($: any, options: Record<string, unknown>) {
   setupError = !ROOT ? `renderers not found (looked in ${roots.join(', ')}); set the plugin's projectDir option` : ''
   if (ROOT) await checkDeno($)
   if (setupError) $.ui.log(`sciviz: ${setupError}`, { to: 'debug' })
-  // per-session state: two Claude sessions never share controls or frames
-  const session = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
-  RUN = `${home}/.cache/terminal-sciviz/sessions/${session}`
+  // per-session state: two Claude sessions never share controls or frames. Named by the session's
+  // id, so a reload or a resume finds the frozen views' PNGs it saved before
+  let session = ''
+  try { const id: unknown = await $.session.id(); if (typeof id === 'string') session = id.replace(/[^A-Za-z0-9_-]/g, '') } catch { /* older host */ }
+  const proc = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
+  // the views' PNGs (named by tool call id) are the session's; controls and frames this process's
+  // alone (two terminals resuming one conversation must not share them)
+  const sessions = `${home}/.cache/terminal-sciviz/sessions`
+  VIEWS = `${sessions}/${session || proc}/views`
+  RUN = `${sessions}/${session || proc}/run-${proc}`
+  // sessions inactive for 30 days go, frozen views with them: `.active` is touched at start and
+  // as views are saved (a directory's own mtime doesn't change as files inside it are rewritten)
+  ACTIVE = `${sessions}/${session || proc}/.active`
+  void $.process.run(['/bin/sh', '-c', 'mkdir -p "$1" && touch "$2" && for d in "$3"/*/; do a="$d.active"; [ -e "$a" ] || a="$d"; [ -n "$(find "$a" -prune -mtime +30)" ] && rm -rf "$d"; done; true',
+    'sh', `${sessions}/${session || proc}`, ACTIVE, sessions]).catch(() => {})
   GALLERY = `${ROOT}/docs`
   try { Object.assign(view, JSON.parse(await $.fs.read(SIZE_FILE()))) } catch { /* first run: defaults until a view draws */ }
 }
@@ -836,7 +905,8 @@ export const register: Register = (on, options) => {
     const input = e as any
     if (input.nurbs !== undefined) { // a surface of Claude's own: it replaces the named one
       const size = JSON.stringify(input.nurbs).length
-      if (size > 64_000) return { deny: `nurbs is ${size} bytes; keep it under 64 kB (an exact low-degree patch, or a coarse control net)` }
+      if (size > 64_000) return { deny: `nurbs is ${size} bytes; keep it under 64 kB (exact low-degree patches, or a coarse control net)` }
+      if (Array.isArray(input.nurbs) && (input.nurbs.length === 0 || input.nurbs.length > 256)) return { deny: 'nurbs: give 1 to 256 patches' }
     }
     const e2 = input.nurbs !== undefined ? { ...input, surface: input.nurbs } : { ...input }
     // a named surface (or a new nurbs) starts with the renderer's own colour range unless one is given
@@ -856,12 +926,33 @@ export const register: Register = (on, options) => {
     return showView($, { ...e, ...overrides }, galleryKind(entry.renderer), Object.keys(overrides), entry.control, entry)
   })
 
+  on('tool.call', { tool: CHART_TOOL }, async ($, e) => {
+    const input = e as any
+    // data goes in files past 64 kB (the control is rewritten on every pointer event); line.ts reads them once
+    const size = JSON.stringify([input.series ?? null, input.marks ?? null, input.overlays ?? null]).length
+    if (size > 64_000) return { deny: `series/marks/overlays are ${size} bytes inline; keep them under 64 kB: write the data to a .json/.csv/.tsv file and give each series or mark \`file\` (absolute path) instead of inline data` }
+    for (const s of [...(Array.isArray(input.series) ? input.series : []), ...(Array.isArray(input.marks) ? input.marks : [])]) {
+      const f = s?.file
+      if (f === undefined) continue
+      if (typeof f !== 'string' || !f.startsWith('/') || !/\.(json|csv|tsv)$/i.test(f)) return { deny: `file must be an absolute path to a .json, .csv or .tsv file: ${f}` }
+      if (!(await $.fs.exists(f))) return { deny: `no such file: ${f}` }
+    }
+    // a new `series` or `marks` starts a new chart (fields not given: the renderer's defaults, but no
+    // demo series); without either, the fields given change the current line chart (this tool's or a
+    // gallery lines/* entry's) and the rest stay
+    const kind = galleryKind('line.ts')
+    const fresh = input.series !== undefined || input.marks !== undefined
+    if (!fresh && !Array.isArray(KINDS[kind]?.ctl.series)) return { deny: 'no chart open yet: pass `marks` (or `series`)' }
+    return showView($, input, kind, CHART_KEYS, fresh ? { title: '', series: [] } : undefined)
+  })
+
   on('tool.call', { tool: PLOT_TOOL }, async ($, e) =>
     showView($, e, 'pchip', ['function', 'n', 'x0', 'x1', 'ymin', 'ymax', 'showTrue', 'showSamples', 'compare']))
 
   on('session.end', async ($, e, next) => {
     for (const k of Object.keys(KINDS)) await stopRenderer($, k).catch(() => {})
-    if (RUN.includes('/.cache/terminal-sciviz/sessions/')) await $.process.run(['/bin/rm', '-rf', RUN]).catch(() => {})
+    // controls, frames, logs go; views/ stays: a resumed conversation still draws its frozen views
+    if (RUN.includes('/.cache/terminal-sciviz/sessions/')) await $.process.run(['/bin/rm', '-rf', RUN]).catch(() => {}) // VIEWS stays: a resume redraws them
     return next(e)
   })
 
@@ -883,6 +974,165 @@ export const register: Register = (on, options) => {
           control: { type: 'object', description: 'overrides of the entry control' },
         },
         required: ['id'],
+      },
+      isDeferred: false,
+    })
+    const axis = {
+      type: 'object',
+      properties: {
+        scale: { type: 'string', enum: ['linear', 'log', 'symlog'] },
+        threshold: { type: 'number', description: 'symlog: linear within ±threshold (default 1)' },
+        ticks: { type: 'string', enum: ['pi', 'exp2', 'exp10'], description: 'pi: at multiples of π; exp2/exp10: the values are log2/log10 of the data, ticks read 2^v / 10^v' },
+        index: { type: 'boolean', description: 'integer ticks (default: when no series gives x)' },
+        categories: { type: 'array', items: { type: 'string' }, description: 'ticks at 0, 1, ... labelled with these (box groups, grouped bars)' },
+      },
+    }
+    await $.tool.register({
+      name: 'chart',
+      description:
+        'Show the user a live, interactive chart of your own data inline in the chat, right here between your text ' +
+        '(WebGPU; they drag to pan x, shift-drag/+/- to zoom, hover for values, r resets). The newest view is live; earlier ones freeze. ' +
+        'Build charts from `marks` (a grammar like Observable Plot): each mark is a type (line, dot, bar, barX, area, rect, rule, text, ' +
+        'interval, box) over `data` columns, its channels naming columns, and optional transforms; bubble, stacked area, histogram, ' +
+        'frequency polygon, rolling mean, violin, grouped/stacked/horizontal bars and heatmaps are combinations. Examples: ' +
+        'bubble {type:"dot", data, x:"gdp", y:"life", r:"pop", fill:"continent"}; frequency polygon {type:"line", data:{v:[...]}, x:"v", transform:{bin:{width:0.5}}}; ' +
+        'violin {type:"area", data, x:"group", y:"value", fill:"group", transform:{density:true}} plus {type:"box", data, x:"group", y:"value"}; ' +
+        'stacked bars {type:"bar", data, x:"year", y:"sales", fill:"region", transform:{stack:true}} (without stack: grouped side by side). ' +
+        'A call with `marks` or `series` opens a new chart (fields not given: defaults); a call without either changes only the fields given ' +
+        '(window, title, axis scale, overlays...) on the current chart and keeps the rest. `series` is the older shorthand (one line per entry, ' +
+        'with bolted-on bars/fill/stat options), drawn under the marks. Each series is one of: x/y inline ' +
+        '(series + overlays under 64 kB of JSON in all), `file` (more data), `fn` (a function of x evaluated in f64, re-sampled as they zoom: ' +
+        'prefer it for mathematical functions) or `sample`. Histograms: `bars: true` on bin centres x and counts y. null y break lines. ' +
+        'Distributions and fits: give raw `samples` (or x/y for linreg) with a `stat`, not precomputed quantiles; it expands into ' +
+        'ordinary geoms (step lines, fills, intervals, boxes, bars, fns) and state.stats returns its numbers. ' +
+        'Text may use Unicode math (𝑥 𝜆̂ 𝑥̄ ℝⁿ 10⁻⁶ ≤ ∇ ⟨⟩); characters the font lacks are listed in state.missingGlyphs. ' +
+        'Waits for the frame and returns the control, renderer state (window, y range) and a PNG snapshot path you can Read to see what the user sees.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          title: { type: 'string' },
+          subtitle: { type: 'string', description: 'dimmer text after the title' },
+          xlabel: { type: 'string' },
+          ylabel: { type: 'string' },
+          x: { ...axis, description: 'x axis' },
+          y: { ...axis, description: 'y axis' },
+          marks: {
+            type: 'array',
+            description: 'drawn in order after any series (fills and bars under lines, dots, rules and text). Strings in x or y make categories ' +
+              '(x left to right, y top to bottom, in order of appearance; bars and rects take a slot each, 0.8 wide); fill strings make a palette legend ' +
+              '(at most 8 categories, in order of appearance), fill numbers a colormap with a colour bar (`color`)',
+            items: {
+              type: 'object',
+              properties: {
+                type: { type: 'string', enum: ['line', 'dot', 'bar', 'barX', 'area', 'rect', 'rule', 'text', 'interval', 'box'], description:
+                  'line: x, y (or fn); dot: x, y (r, fill); bar: vertical, band x (category, or x1/x2 from bin), 0..y (or y1..y2 from stack); barX: horizontal, band y, 0..x; ' +
+                  'area: x, 0..y or y1..y2 (or fn: 0..f); with x1, x2 and y (density of a categorical x): a violin, x1..x2 as functions of y; rect: x1..x2 × y1..y2, or a band of a category ' +
+                  '/ the unit cell around a number on each axis (heatmaps); rule: y alone (horizontal lines across, x1..x2 to shorten) or x alone (vertical); ' +
+                  'text: x, y, text; interval: x, y1..y2 (error bars, cap); box: box plots of y per x (boxplot transform)' },
+                data: { description: 'columns {name: [...], ...} (one length) or rows [{name: value, ...}, ...]; numbers, strings (categories), null (a gap)' },
+                file: { type: 'string', description: 'instead of data: absolute path to a .csv/.tsv with a header row (columns by name) or .json (columns or rows); re-read when it changes' },
+                fn: { description: 'line, area: instead of data, a function of x evaluated in f64 and re-sampled on zoom (the series `fn`: a name or {expr, params, domain})' },
+                x: { type: ['string', 'number'], description: 'channel: a column name, a number constant; or after a transform the name of its output ("x", "y", ...)' },
+                y: { type: ['string', 'number'] }, x1: { type: ['string', 'number'] }, x2: { type: ['string', 'number'] }, y1: { type: ['string', 'number'] }, y2: { type: ['string', 'number'] },
+                z: { type: ['string', 'number'], description: 'a column grouping rows into separate series (stack order, dodge, lines per group); default: a categorical fill' },
+                fill: { type: ['string', 'number'], description: 'colour: a column (strings: categories, a legend entry each; numbers: the colormap) or a CSS colour; stroke is the same channel' },
+                stroke: { type: ['string', 'number'] },
+                r: { type: ['string', 'number'], description: 'dot radius: a column (sqrt scale, area ∝ value, top-level `r`) or CSS px' },
+                opacity: { type: ['string', 'number'], description: '0..1, a column or constant (areas: fill opacity, default 0.3, stacked 0.75)' },
+                text: { type: ['string', 'number'], description: 'text: a column, a transform output (e.g. "y": a bin count), or a constant' },
+                transform: {
+                  type: 'object',
+                  description: 'applied in this order: bin {width? | thresholds?, reduce?: count|density|proportion} (x → x1, x2, x centre, y; bins shared by the z groups); ' +
+                    'group {reduce?: count|sum|mean, sort?: asc|desc} (rows by the band category, x (barX: y), and z → y (barX: x)); window {k, reduce?: mean|median|min|max|sum} ' +
+                    '(rolling over k points centred, by x per group); density {bandwidth? (default Silverman), width? (violin slot fraction, 0.9)} (Gaussian KDE of x → x, y; ' +
+                    'of y per x category → violins); then stack {offset?: none|expand|center} (y across z at each x → y1, y2; barX: x). Or one stat: ecdf {band?: α}, ' +
+                    'qq {reference?}, linreg {band?: α, kind?: mean|prediction} on x, y, boxplot {width?} of y per x. `true` takes the defaults, e.g. {bin: true, stack: true}',
+                },
+                label: { type: 'string', description: 'legend entry of a mark without categorical fill' },
+                legend: { type: 'boolean' },
+                extent: { type: 'boolean', description: 'false: drawn, but sets neither the x window nor the y range' },
+                width: { type: 'number', description: 'line width, CSS px' },
+                dash: { type: 'boolean' },
+                interpolation: { type: 'string', enum: ['linear', 'pchip', 'spline', 'step'] },
+                cap: { type: 'number', description: 'interval: cap width, CSS px (6)' },
+                inset: { type: 'number', description: 'bar, rect: CSS px off each side (bars 1, rects 0)' },
+                anchor: { type: 'string', description: 'text: horizontal l|m|r then vertical t|m|b, e.g. "lm" (default "mm")' },
+                dx: { type: 'number', description: 'text: offset, CSS px' },
+                dy: { type: 'number' },
+              },
+              required: ['type'],
+            },
+          },
+          color: { type: 'object', description: 'marks\' colour scale: {scheme?: a colormap (viridis, magma, turbo, rdbu, ...) for numeric fill, domain?: [lo, hi] or the categories in order, label?: colour bar title, invert?}' },
+          r: { type: 'object', description: 'marks\' radius scale: {range?: [2, 12] CSS px, domain?: [0, max]}' },
+          series: {
+            type: 'array',
+            description: 'the older shorthand: drawn in order (later on top), under the marks',
+            items: {
+              type: 'object',
+              properties: {
+                x: { type: 'array', items: { type: 'number' }, description: 'default: 0, 1, 2, ...' },
+                y: { type: 'array', items: { type: ['number', 'null'] }, description: 'null: a gap' },
+                file: { type: 'string', description: 'instead of x/y: absolute path to a .json ({x?, y} or [y, ...]) or a .csv/.tsv of 1 (y) or 2 (x, y) columns (a header line and # comments are skipped); read by the renderer, again when the file changes' },
+                fn: {
+                  description: 'instead of x/y: a function of x evaluated in f64 (special functions: Boost.Math) over the visible window: a name or {name, ...params, domain?: [a, b]}. ' +
+                    'Names (params): bumps, blocks, runge, step, besselJ (order ν), sinc (k: sin(kx)/(kx)), bode (f0, zeta), dispersion (band), ' +
+                    'dampedCos (tau, omega: exp(-x/tau) cos(omega x)), poisson (lambda, scale: scale λ^x e^-λ / Γ(x+1)). ' +
+                    'Or any function of x as an expression: {expr: "a*exp(-(x-m)^2/(2*s^2))", params: {a: 1, m: 0, s: 1}, domain: [-4, 4]}: ' +
+                    '+ - * / ^ (or **), comparisons (1 or 0), pi, e, sin cos tan asin acos atan atan2 sinh cosh tanh exp log log2 log10 sqrt cbrt ' +
+                    'abs sign floor ceil min max pow hypot erf erfc lgamma (ln|Γ|) tgamma digamma zeta expint (Ei) besselJ besselY besselI besselK (ν, x) ' +
+                    'airyAi lambertW (W₀) ellipK (modulus k) sinc (sin x / x); poles and domain errors give NaN (a gap)',
+                },
+                sample: { type: 'object', description: 'instead of x/y: {fn, n}: n even samples of fn over its domain (e.g. to show an interpolation)' },
+                label: { type: 'string', description: 'legend entry (unlabelled series stay out of the legend)' },
+                color: { type: 'string', description: 'CSS hex (default: the next palette colour)' },
+                width: { type: 'number', description: 'line width, CSS px (default 1.5)' },
+                dash: { type: 'boolean' },
+                markers: { enum: [true, false, 'only'], description: 'true: dots at the points; "only": dots and no line' },
+                bars: { type: ['boolean', 'number'], description: 'a bar per point, from 0: true = as wide as the closest x spacing, a number = that width in x units' },
+                opacity: { type: 'number', description: '0..1 (default 1)' },
+                interpolation: { type: 'string', enum: ['linear', 'pchip', 'spline', 'step'], description: 'between points (default linear); pchip: monotone cubic; spline: not-a-knot cubic; step: flat to the next x, then jump' },
+                envelope: { type: 'object', description: '{type: "cummin"|"cummax", mode?: "add" (an extra series, default)|"replace", reverse?: boolean, color?}: running min/max' },
+                legend: { type: 'boolean', description: 'default: whether it has a label' },
+                fill: {
+                  type: 'object',
+                  description: '{lo?, hi?, opacity? (0.2)}: shade between two bounds, below the lines; each a number (e.g. 0: area under), an array (one per x, ' +
+                    'interpolated like the series) or an fn spec; a missing one is the series\' own y / fn. Without y: only the band (confidence band, its own legend swatch)',
+                },
+                intervals: { type: 'object', description: '{lo: [...], hi: [...], cap?: px (6), label?}: a vertical range at each x (error bars), in the series colour' },
+                box: { type: 'object', description: '{q1: [...], q3: [...], width?: x units (0.6)}: a box q1..q3 at each x, y = its median line' },
+                samples: { type: 'array', items: { type: 'number' }, description: 'raw samples for `stat` (or `file`\'s y)' },
+                stat: {
+                  description: 'a name or {type, ...options}: "ecdf" (band?: α, e.g. 0.05: DKW band), "qq" (normal Q–Q; reference?: false drops the quartile line), ' +
+                    '"box" (position?: x, default its index among box series; width?), "hist" (bins? | binWidth?, default Freedman–Diaconis; density?), ' +
+                    '"linreg" on x/y (band?: α, default 0.05; kind?: "mean" | "prediction"): data markers, fit ŷ = a + bx and its t band',
+                },
+              },
+            },
+          },
+          overlays: {
+            type: 'array',
+            description: 'reference lines and bands',
+            items: {
+              type: 'object',
+              properties: {
+                kind: { type: 'string', enum: ['hline', 'vline', 'band'] },
+                axis: { type: 'string', enum: ['x', 'y'], description: 'band: the axis of its values (default x)' },
+                values: { type: 'array', items: { type: 'number' }, description: 'hline/vline: [v]; band: [lo, hi]' },
+                label: { type: 'string' },
+                color: { type: 'string', description: 'CSS hex (default #666666)' },
+                width: { type: 'number' },
+                dash: { type: 'boolean' },
+              },
+              required: ['kind', 'values'],
+            },
+          },
+          legend: { type: 'boolean', description: 'default true (in the emptiest corner)' },
+          x0: { type: ['number', 'null'], description: 'visible x window start, data units; null: all data' },
+          x1: { type: ['number', 'null'] },
+          ymin: { type: ['number', 'null'], description: 'null: fit what is visible' },
+          ymax: { type: ['number', 'null'] },
+        },
       },
       isDeferred: false,
     })
@@ -919,13 +1169,14 @@ export const register: Register = (on, options) => {
       inputSchema: {
         type: 'object',
         properties: {
-          surface: { type: 'string', enum: SURFACES, description: 'a built-in surface; dini and breather: pseudospherical (curvature -1), coloured by height / the sine-Gordon angle' },
+          surface: { type: 'string', enum: SURFACES, description: 'a built-in surface; dini and breather: pseudospherical (curvature -1), coloured by height / the sine-Gordon angle; teapot: Newell\'s 32 bicubic Bézier patches, exact (by height; mean-curvature with rdbu reads well)' },
           nurbs: {
-            type: 'object',
+            type: ['object', 'array'],
+            items: { type: 'object' },
             description: 'a surface of your own instead of `surface`: {degrees: [p, q], shape: [nu, nv], points: flat xyz (nu*nv*3, u outer), ' +
               'weights: nu*nv, knots: [u knots (nu+p+1), v knots (nv+q+1)], fields?: [nu*nv control values]}. A polynomial graph z = f(x, y) ' +
               'is exactly a Bezier patch (Bernstein coefficients); colour by `field` for a scalar on it (e.g. det of the Hessian), ' +
-              'or by gaussian-/mean-curvature',
+              'or by gaussian-/mean-curvature. Or an array of such patches drawn together (a model made of Bézier patches; hover reports `patch`)',
           },
           colorBy: { type: 'string', enum: ['field', 'height', 'field-gradient', 'height-gradient', 'gaussian-curvature', 'mean-curvature'] },
           colormap: { type: 'string', enum: [...SEQUENTIAL_MAPS, ...DIVERGING_MAPS, ...CYCLICAL_MAPS].map((m) => m.toLowerCase()), description: 'diverging maps (rdbu, puor, ...) for signed values, with a symmetric `domain`' },
@@ -983,9 +1234,25 @@ export const register: Register = (on, options) => {
     return { result: JSON.stringify(shown) }
   })
 
+  // A view's call row (`sciviz - chart (MCP)(title: ..., series: [...])`) is code in the middle of
+  // the explanation: the figure stands alone between the text. ctrl+o (expanded) and errors show it.
+  on('ui.render', { component: 'ToolUse' }, async ($, e, next) => {
+    const views = [VIEW_TOOL, PLOT_TOOL, OPEN_TOOL, CHART_TOOL]
+    if (!views.includes(e.props.tool) || e.props.isExpanded || e.props.isErrored || e.surface !== 'terminal') return next(e)
+    const { Box } = $.ui.resolve(e)
+    return <Box />
+  })
+
   on('ui.render', { component: 'ToolResult' }, async ($, e, next) => {
-    if ((e.props.tool === VIEW_TOOL || e.props.tool === PLOT_TOOL || e.props.tool === OPEN_TOOL) && !e.props.isErrored && e.surface === 'terminal') {
-      const kind = kindOf[e.props.tool_use_id] ?? (e.props.tool === VIEW_TOOL ? 'surface' : e.props.tool === PLOT_TOOL ? 'pchip' : undefined)
+    if ((e.props.tool === VIEW_TOOL || e.props.tool === PLOT_TOOL || e.props.tool === OPEN_TOOL || e.props.tool === CHART_TOOL) && !e.props.isErrored && e.surface === 'terminal') {
+      // after a reload kindOf is empty: these rows are all frozen PNGs then, but they need their kind
+      let kind = kindOf[e.props.tool_use_id] ?? (e.props.tool === VIEW_TOOL ? 'surface' : e.props.tool === PLOT_TOOL ? 'pchip' : e.props.tool === CHART_TOOL ? galleryKind('line.ts') : undefined)
+      if (!kind && e.props.tool === OPEN_TOOL) {
+        const out = e.props.output as any
+        const id = (out?.entry ?? JSON.stringify(out).match(/\\?"entry\\?":\\?"([^"\\]+)/)?.[1]) as string | undefined
+        const entry = id ? (await entries($)).find((x) => x.id === id) : undefined
+        if (entry) kind = galleryKind(entry.renderer)
+      }
       if (kind) return drawView($, e, e.props.tool_use_id, kind)
     }
     if (e.props.tool !== TOOL || e.props.isErrored || e.surface !== 'terminal') return next(e)

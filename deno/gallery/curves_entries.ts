@@ -58,7 +58,7 @@ const nurbsEntries: Entry[] = [
 ];
 
 // three_d/curves/trefoil_curvature: (tx, ty, tz) with curvature κ = |r′ × r″| / |r′|³, 1500
-// points, evaluated on the GPU by curve.ts from the `gen` spec
+// points, evaluated (f64) by curve.ts from the `gen` spec
 const trefoilCurvature: Entry = {
   id: "curves/trefoil_curvature",
   section: "curves",
@@ -76,7 +76,7 @@ const trefoilCurvature: Entry = {
   interaction: "orbit",
 };
 
-// basics/complex: chirp (t, ℜ, ℑ) colored by phase (1200 points from the `gen` spec, on the GPU),
+// basics/complex: chirp (t, ℜ, ℑ) colored by phase (1200 points from the `gen` spec, f64),
 // Cornu spiral C + iS in the plane (cumulative quadrature: on the CPU)
 const chirp: Entry = {
   id: "complex/chirp",
@@ -148,4 +148,59 @@ const lorenzRoot: Entry = {
   control: { ...lorenz.control, ode: { system: "lorenz", n: 40_000, dt: 0.004, colorBy: "speed" }, scale: "root", rootN: 0.5 },
 };
 
-export const entries: Entry[] = [...nurbsEntries, trefoilCurvature, lorenz, lorenzRoot, chirp, cornu];
+// three.js's webgl_lines_fat: a 3D Hilbert curve (as GeometryUtils.hilbert3D: corners of a cube
+// visited recursively, each sub-cube's corners permuted) through which a smooth curve is drawn
+// thick, with a hue gradient. Here the curve is exact: three's Catmull-Rom spline through the 64
+// points (one iteration; 512 with two) as a NURBS, on screen 6 px wide with round joins
+function hilbert3D(center: number[], size: number, iterations: number, v = [0, 1, 2, 3, 4, 5, 6, 7]): number[][] {
+  const h = size / 2;
+  const [cx, cy, cz] = center;
+  const corners = [
+    [cx - h, cy + h, cz - h], [cx - h, cy + h, cz + h], [cx - h, cy - h, cz + h], [cx - h, cy - h, cz - h],
+    [cx + h, cy - h, cz - h], [cx + h, cy - h, cz + h], [cx + h, cy + h, cz + h], [cx + h, cy + h, cz - h],
+  ];
+  const vec = v.map((i) => corners[i]);
+  if (iterations <= 0) return vec;
+  const [v0, v1, v2, v3, v4, v5, v6, v7] = v;
+  const orders = [
+    [v0, v3, v4, v7, v6, v5, v2, v1], [v0, v7, v6, v1, v2, v5, v4, v3], [v0, v7, v6, v1, v2, v5, v4, v3], [v2, v3, v0, v1, v6, v7, v4, v5],
+    [v2, v3, v0, v1, v6, v7, v4, v5], [v4, v3, v2, v5, v6, v1, v0, v7], [v4, v3, v2, v5, v6, v1, v0, v7], [v6, v5, v2, v1, v0, v3, v4, v7],
+  ];
+  return vec.flatMap((c, k) => hilbert3D(c, h, iterations - 1, orders[k]));
+}
+
+/** Uniform Catmull-Rom spline through `pts` (ends extended by reflection, as three's
+ * CatmullRomCurve3; centripetal = uniform for equal steps) as a C¹ cubic B-spline: segment i the
+ * Bézier p_i, p_i + (p_{i+1} − p_{i−1})/6, p_{i+1} − (p_{i+2} − p_i)/6, p_{i+1}; knots of
+ * multiplicity 3 at the points (u = their index). */
+function catmullRom(pts: number[][]): { degree: number; points: number[][]; knots: number[] } {
+  const n = pts.length;
+  const at = (i: number) => pts[i] ?? (i < 0 ? pts[0].map((x, d) => 2 * x - pts[1][d]) : pts[n - 1].map((x, d) => 2 * x - pts[n - 2][d]));
+  const points = [pts[0]];
+  for (let i = 0; i < n - 1; i += 1) {
+    const [p0, p1, p2, p3] = [at(i - 1), at(i), at(i + 1), at(i + 2)];
+    points.push(p1.map((x, d) => x + (p2[d] - p0[d]) / 6), p2.map((x, d) => x - (p3[d] - p1[d]) / 6), p2);
+  }
+  const knots = [0, 0, 0, 0, ...Array.from({ length: n - 2 }, (_, i) => [i + 1, i + 1, i + 1]).flat(), n - 1, n - 1, n - 1, n - 1];
+  return { degree: 3, points, knots };
+}
+
+const hilbertFat: Entry = {
+  id: "curves/hilbert_fat",
+  section: "curves",
+  title: "hilbert_fat",
+  description: "fat line: a 3D Hilbert curve (64 points) through a Catmull-Rom spline (exact, a C¹ cubic B-spline), 6 px wide with round joins, Sinebow hue along 𝑢",
+  renderer: "curve.ts",
+  control: {
+    title: "3D Hilbert curve, Catmull-Rom spline",
+    curve: catmullRom(hilbert3D([0, 0, 0], 20, 1)),
+    colormap: "Sinebow",
+    lineWidth: 6,
+    lineCap: "round",
+    azimuth: 30,
+    elevation: 25,
+  },
+  interaction: "orbit",
+};
+
+export const entries: Entry[] = [...nurbsEntries, trefoilCurvature, lorenz, lorenzRoot, hilbertFat, chirp, cornu];
