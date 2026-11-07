@@ -16,7 +16,7 @@
  */
 
 import { axisTicks, colorBarTicks, createScale, formatNumber, snapRootN } from "./lib/scales.ts";
-import { cameraBasis, fitAngles, fitView, type Vec3 } from "./lib/framing.ts";
+import { cameraBasis, fitAngles, fitView, screenRect, type Vec3 } from "./lib/framing.ts";
 import { lookAtView, mul4, perspectiveProjection } from "./lib/mat4.ts";
 import { colormapName, colormapRgb, getLinearColorLut } from "./lib/colormaps.ts";
 import {
@@ -373,6 +373,7 @@ export class CurvePlot implements ServeRenderer<Control> {
   private values?: (u: number) => number;
   private fitPoints = new Float64Array(0);
   viewProjection: number[] = [];
+  content: [number, number, number, number] | null = null; // the 3D curve's pixels (state)
   private plot3: [number, number, number, number] = [0, 0, 1, 1];
   private chrome?: Quads;
   private distance = 1;
@@ -604,6 +605,7 @@ export class CurvePlot implements ServeRenderer<Control> {
     const toRect = [pw / w, 0, 0, 0, 0, ph / h, 0, 0, 0, 0, 1, 0, (L + R) / w - 1, 1 - (T + B) / h, 0, 1];
     const vp = mul4(toRect, mul4(projection, lookAtView(eye, this.target, [0, 0, 1])));
     this.viewProjection = vp;
+    this.content = screenRect(this.fitPoints, vp, w, h);
     const draw = (r: NurbsCurve3DGpuRenderer, c: NurbsCurve, canvas: TextureTarget, width: number) => {
       canvas.width = w;
       canvas.height = h;
@@ -801,7 +803,7 @@ export class CurvePlot implements ServeRenderer<Control> {
     const base = { generation, width: this.size[0], height: this.size[1], dims: this.curve.dims, hover, renderMs: Math.round(ms * 1000) / 1000 };
     if (this.is3D) {
       const root = this.slider ? { rootN: this.slider.value, rootSlider: this.slider } : {};
-      return { ...base, azimuth: ctl.azimuth, elevation: ctl.elevation, distance: this.distance, target: this.target, plotRect: this.plot3, colorDomain: this.barDomain, ...root };
+      return { ...base, azimuth: ctl.azimuth, elevation: ctl.elevation, distance: this.distance, target: this.target, plotRect: this.plot3, content: this.content, colorDomain: this.barDomain, ...root };
     }
     const v = this.view2!;
     return { ...base, x0: v.x0, x1: v.x1, ymin: v.y0, ymax: v.y1, plotRect: v.plot };

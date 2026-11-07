@@ -14,7 +14,7 @@
  * the frame by lib/overlay.ts.
  */
 
-import { cameraBasis, fitAngles, fitView, type Vec3 } from "./lib/framing.ts";
+import { cameraBasis, fitAngles, fitView, screenRect, type Vec3 } from "./lib/framing.ts";
 import { lookAtView, mul4, perspectiveProjection } from "./lib/mat4.ts";
 import { getLinearColorLut, colormapName, colormapRgb } from "./lib/colormaps.ts";
 import { colorBarTicks, createScale, getShaderScale, snapRootN, type VisScale } from "./lib/scales.ts";
@@ -622,9 +622,10 @@ export class SurfaceRenderer implements ServeRenderer<Control> {
 
   state(input: Control, generation: number, hover: unknown, ms: number): unknown {
     const ctl = { ...input, ...this.resolvedCamera(input) };
-    const { eye } = SurfaceRenderer.camera(ctl);
+    const { eye, viewProjection } = SurfaceRenderer.camera(ctl);
     return {
       generation,
+      content: screenRect(this.fitPoints, viewProjection, Math.trunc(ctl.width), Math.trunc(ctl.height)), // the surface's pixels
       width: Math.trunc(ctl.width),
       height: Math.trunc(ctl.height),
       camera: {

@@ -123,7 +123,7 @@ const viewInfo: Record<string, { interaction: Interaction; home: Ctl; entry?: En
 const opens: Record<string, { kind: Kind; interaction: Interaction; home: Ctl; entry?: Entry; bound?: string }> = {}
 let latestOpen = '' // the newest open's token: its row becomes live when it renders
 let openSeq = 0
-const view = { live: '', liveMinRev: 0, intended: '', cols: 80, rows: 25, pxW: 960, pxH: 600,
+const view = { live: '', liveMinRev: 0, intended: '', cols: 80, rows: 25, pxW: 960, pxH: 600, input: null as null | { cols: number; rows: number; rect: number[] },
   drag: null as null | { x: number; y: number; ctl: Ctl; win: Win | null; zooming: boolean } }
 
 const cycle = (list: string[], cur: string) => list[(list.indexOf(cur) + 1) % list.length]
@@ -242,7 +242,7 @@ async function startRenderer($: any, kind: Kind) {
           const m = /^frame (\d+) (\d+) (\d+)(?: (\S+))?(?: (\d+))?/.exec(line)
           if (m) { await onFrame($, kind, +m[1], +m[2], +m[3], m[4] === '-' ? undefined : m[4], +(m[5] ?? 0)); continue }
           const snap = /^snapshot(failed)? (\d+) (.+)$/.exec(line)
-          if (snap) onSnapshot(kind, +snap[2], snap[3], !!snap[1])
+          if (snap) { onSnapshot(kind, +snap[2], snap[3], !!snap[1]); if (!view.drag && kind === liveKind()) void refreshInputRect($, kind) }
         }
       }
     } catch (err) {
@@ -305,6 +305,7 @@ async function makeLive($: any, id: string) {
   const kind = kindOf[id]
   view.live = id
   view.liveMinRev = nextRev(kind)
+  view.input = null // the whole view takes input until its renderer says where the object is
   void startPlayback($, id) // a no-op unless the entry plays (and it stops any other)
   for (const k of Object.keys(KINDS)) if (k !== kind && k.startsWith('g-')) void stopRenderer($, k)
 }
@@ -347,11 +348,13 @@ async function drawView($: any, e: any, id: string, kind: Kind) {
   if (problem) return <Text color="red">sciviz: {problem}</Text>
   const source = havePng ? { file: png, format: 'png', generation: saved[png] ?? 0 } : { rgba: BLANK, width: 1, height: 1 }
   if (running[kind]) void writeControl($, kind)
+  // input only over the object (3D views): presses on the empty frame around it select transcript text
+  const inRect = view.input && view.input.cols === cols && view.input.rows === rows ? view.input.rect : [0, 0, cols, rows]
   return (
     <Box width={cols} height={rows}>
       <Image key="view" source={source} columns={cols} rows={rows} alt={setupError || lastError[kind] ? `sciviz: ${setupError || lastError[kind]}` : 'sciviz: starting the GPU renderer…'} />
-      <Box position="absolute" top={0} left={0}>
-        <Client key="input" module="./input.tsx" width={cols} height={rows} />
+      <Box position="absolute" top={inRect[1]} left={inRect[0]}>
+        <Client key="input" module="./input.tsx" width={inRect[2]} height={inRect[3]} />
       </Box>
     </Box>
   )
@@ -477,6 +480,25 @@ async function rootSlider($: any, kind: Kind) {
   } catch { return null }
 }
 
+/** After a settled frame of a 3D view: the cells its object covers (state.json `content`, plus the
+ * root slider and a cell of slack), so the input region can shrink to them. Redraws when it moved. */
+async function refreshInputRect($: any, kind: Kind) {
+  let st: any
+  try { st = JSON.parse(await $.fs.read(`${dir(kind)}/state.json`)) } catch { return }
+  const { cols, rows } = view
+  let rect: number[] | null = null
+  if (Array.isArray(st?.content) && st.width > 0 && st.height > 0) {
+    const boxes = [st.content, ...(Array.isArray(st.rootSlider?.rect) ? [st.rootSlider.rect] : [])]
+    const [x0, y0, x1, y1] = boxes.reduce((a: number[], b: number[]) => [Math.min(a[0], b[0]), Math.min(a[1], b[1]), Math.max(a[2], b[2]), Math.max(a[3], b[3])])
+    const cx0 = Math.max(0, Math.floor((x0 / st.width) * cols) - 1), cy0 = Math.max(0, Math.floor((y0 / st.height) * rows) - 1)
+    const cx1 = Math.min(cols, Math.ceil((x1 / st.width) * cols) + 1), cy1 = Math.min(rows, Math.ceil((y1 / st.height) * rows) + 1)
+    if (cx1 > cx0 && cy1 > cy0) rect = [cx0, cy0, cx1 - cx0, cy1 - cy0]
+  }
+  const was = view.input?.rect?.join(',') ?? ''
+  view.input = rect ? { cols, rows, rect } : null
+  if ((rect?.join(',') ?? '') !== was) $.ui.invalidate('ui.render')
+}
+
 let overlaySeq = 0
 const overlayOut = { busy: false, next: '' }
 /** Latest-only, serialized: an older position never lands after a newer one. */
@@ -495,7 +517,9 @@ async function onPointer($: any, kind: Kind, ev: any) {
   const interaction = viewInfo[view.live]?.interaction ?? legacyInteraction(kind)
   // the image's own size in cells: the input region can be clipped by the screen edge, the image's coordinates are not
   const cols = view.cols || ev.columns, rows = view.rows || ev.rows
-  const x = ev.fine?.x ?? ev.x + 0.5, y = ev.fine?.y ?? ev.y + 0.5
+  // region-relative -> view cells: the input region may be only the object's part of the view
+  const off = view.input && view.input.cols === cols && view.input.rows === rows ? view.input.rect : [0, 0]
+  const x = (ev.fine?.x ?? ev.x + 0.5) + off[0], y = (ev.fine?.y ?? ev.y + 0.5) + off[1]
   // a move with no button held while a drag is open: its `up` was lost (outside the view, a remount).
   // End the drag, or every hover would keep orbiting the camera and re-rendering.
   if (view.drag && ev.type === 'move' && !ev.button) ev = { ...ev, type: 'up' }
@@ -799,8 +823,8 @@ export const register: Register = (on, options) => {
 
   on('ui.message', async ($, e, next) => {
     const kind = liveKind()
-    if (e.requestId !== view.live || !kind) return next(e)
     const data = e.data as any
+    if (e.requestId !== view.live || !kind) return next(e)
     for (const ev of data?.type === 'batch' && Array.isArray(data.events) ? data.events : [data]) {
       if (ev?.type === 'key') await onKey($, kind, String(ev.key))
       else if (ev?.type) await onPointer($, kind, ev)

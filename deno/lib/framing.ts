@@ -5,6 +5,27 @@ export type Vec3 = [number, number, number];
 
 export const MAX_ELEVATION = 89.9; // degrees; z stays "up" in the image
 
+/** The pixel rectangle [x0, y0, x1, y1] (y down) that `points` (flat world xyz) cover on screen
+ * under `viewProjection` (column-major), clamped to the frame; null if none is in front. The
+ * client makes only this part of a view interactive, so presses on the empty frame around an
+ * object fall through to the transcript (text selection). */
+export function screenRect(points: ArrayLike<number>, viewProjection: ArrayLike<number>, width: number, height: number): [number, number, number, number] | null {
+  const e = viewProjection;
+  let [x0, y0, x1, y1] = [Infinity, Infinity, -Infinity, -Infinity];
+  for (let i = 0; i + 2 < points.length; i += 3) {
+    const [x, y, z] = [points[i], points[i + 1], points[i + 2]];
+    const w = e[3] * x + e[7] * y + e[11] * z + e[15];
+    if (!(w > 1e-9)) continue;
+    const px = (((e[0] * x + e[4] * y + e[8] * z + e[12]) / w + 1) / 2) * width;
+    const py = ((1 - (e[1] * x + e[5] * y + e[9] * z + e[13]) / w) / 2) * height;
+    if (!Number.isFinite(px) || !Number.isFinite(py)) continue;
+    x0 = Math.min(x0, px); x1 = Math.max(x1, px); y0 = Math.min(y0, py); y1 = Math.max(y1, py);
+  }
+  if (!(x1 >= x0)) return null;
+  const c = (v: number, hi: number) => Math.round(Math.min(hi, Math.max(0, v)));
+  return [c(x0, width), c(y0, height), c(x1, width), c(y1, height)];
+}
+
 /** The view angles the camera is fitted from: `fitAt` [azimuth, elevation] when set (the client
  * pins it while orbiting, so the pivot and distance stay put), else the view's own. */
 export function fitAngles(ctl: { azimuth: number; elevation: number; fitAt?: unknown }): [number, number] {

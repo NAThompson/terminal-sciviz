@@ -58,7 +58,7 @@ import {
   SAMPLES_PER_VOXEL,
 } from "./lib/volume_utils.ts";
 import { CENTROID_BASE, getCaseTriangles } from "./lib/marching_cubes.ts";
-import { cameraBasis, fitAngles, fitView, type Vec3 } from "./lib/framing.ts";
+import { cameraBasis, fitAngles, fitView, screenRect as pixelRect, type Vec3 } from "./lib/framing.ts";
 import { makeReadBuffer, rowBytes } from "./lib/gpu.ts";
 import { BitmapFont, type FontSize, FRAME_FORMAT, OverlayRenderer, premul, Quads, type Rgba, rootSlider, type RootSlider, rootSliderHeight } from "./lib/overlay.ts";
 import { main, type Pending, type Renderer as ServeRenderer } from "./lib/serve.ts";
@@ -1022,6 +1022,7 @@ export class VolumePlot implements ServeRenderer<Control> {
   private scale = 1;
   private slider: RootSlider | null = null; // of the root scale, as drawn
   // Of the last frame, for the hover read-out and state.json
+  content: [number, number, number, number] | null = null; // the box's pixels, for the client (state)
   private view!: {
     vpWorld: Mat4; boxToWorld: Mat4; boxSize: Vec3; camBox: Vec3; dirOf: (x: number, y: number) => Vec3;
     target: Vec3; distance: number; plot: [number, number, number, number];
@@ -1525,6 +1526,7 @@ export class VolumePlot implements ServeRenderer<Control> {
     const toRect = rows(pw / w, 0, 0, (L + R) / w - 1, 0, ph / h, 0, 1 - (T + B) / h, 0, 0, 1, 0, 0, 0, 0, 1);
     const zFix = rows(1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0.5, 0.5, 0, 0, 0, 1); // GL clip z to WebGPU's
     const vpWorld = mul(zFix, toRect, proj, invert(camWorld));
+    this.content = pixelRect(corners, vpWorld, w, h); // the box's pixels (state)
     const model = mul(b2w, scaling(...boxSize));
     const clip = mul(vpWorld, model);
     const camBoxV = apply(invert(model), eye);
@@ -1987,7 +1989,7 @@ export class VolumePlot implements ServeRenderer<Control> {
     const meta = this.data!.meta;
     return {
       generation, width: this.size[0], height: this.size[1], hover, renderMs: Math.round(ms * 1000) / 1000,
-      azimuth: ctl.azimuth, elevation: ctl.elevation, distance: this.view.distance, target: this.view.target, plotRect: this.view.plot,
+      azimuth: ctl.azimuth, elevation: ctl.elevation, distance: this.view.distance, target: this.view.target, plotRect: this.view.plot, content: this.content,
       shape: meta.shape, slice: this.data!.slice, slices: meta.slices, boxSize: this.view.boxSize,
       dataDomain: this.data!.dataDomain, domain: c.domain, colorDomain: c.barDomain, colormap: c.colormap, scale: c.vis,
       ...(this.slider ? { rootN: this.slider.value, rootSlider: this.slider } : {}),
