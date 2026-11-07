@@ -73,7 +73,7 @@ or a named fn's `order`/`lambda`/`tau`/`omega`/`zeta`, in every series and mark)
 user set (call `chart` again without `marks` to read them); unknown names come back as an error.
 
 **Charts are combinations of marks, channels and transforms**, not special options. Strings in
-`x`/`y` become categories; a string `fill` colours by category (palette legend, at most 8; it also
+`x`/`y` become categories; a string `fill` colours by category (Okabe–Ito palette legend, at most 7; it also
 groups rows like `z`), a numeric `fill` through a colormap (`color: {scheme, domain}`, colour bar);
 `r` is a sqrt (area) scale. E.g. bubble `{type: "dot", data, x: "gdp", y: "life", r: "pop", fill: "continent"}`;
 stacked area `{type: "area", data, x: "year", y: "v", fill: "sector", transform: {stack: true}}`
@@ -81,6 +81,7 @@ stacked area `{type: "area", data, x: "year", y: "v", fill: "sector", transform:
 (stack: true stacks them); horizontal counts of raw rows `{type: "barX", y: "lang", transform: {group: {sort: "desc"}}}`
 with `{type: "text", y: "lang", x: "x", text: "x", anchor: "lm", dx: 6, transform: {group: {sort: "desc"}}}`;
 heatmap `{type: "rect", x: "hour", y: "day", fill: "load"}`; a reference `{type: "rule", y: 0}`.
+Five or more labelled lines also get their names at their right ends (`endLabels: false|true` overrides).
 
 **Distributions and fits: pass raw data with a transform**, not bins or quantiles you computed:
 `bin` (`width`/`thresholds`, `reduce: count|density|proportion`) under a `bar` (histogram) or a

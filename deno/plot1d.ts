@@ -22,7 +22,7 @@ import { FUNCTIONS, getPchipSlopes, hermiteAt, hermiteNurbs, linspace, notAKnotS
 import { loadControl, main, type Pending, renderOnce, type Renderer as ServeRenderer } from "./lib/serve.ts";
 
 // GitHub Dark (terminal theme)
-const BLUE = "#3987e5", ORANGE = "#d95926", INK = "#c9d1d9", INK2 = "#8b949e", GRID = "#262c36";
+const BLUE = "#56B4E9", ORANGE = "#E69F00", INK = "#c9d1d9", INK2 = "#8b949e", GRID = "#262c36";
 const SURFACE = "#101216", ZERO = "#484f58", HOVER_RING = "#e6edf3";
 const TRUE_ALPHA = 0.55;
 const PCHIP_WIDTH = 2.5, TRUE_WIDTH = 1.2, CUBIC_WIDTH = 1.5;

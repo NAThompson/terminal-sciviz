@@ -9,7 +9,7 @@
 import type { Entry } from "./types.ts";
 import { linspace, normalRng } from "../lib/specfun.ts";
 
-const BLUE = "#3987e5", ORANGE = "#d95926", AQUA = "#199e70", MAGENTA = "#d55181", RED = "#e66767", INK2 = "#8b949e";
+const BLUE = "#56B4E9", ORANGE = "#E69F00", AQUA = "#009E73", MAGENTA = "#CC79A7", RED = "#D55E00", INK2 = "#8b949e";
 const PI = Math.PI;
 
 const range = (a: number, b: number) => Array.from({ length: b - a }, (_, i) => a + i);
@@ -294,9 +294,9 @@ const binLine = mark("marks_bin_line", "one sample, three summaries", "bin → b
   xlabel: "𝑣",
   ylabel: "density",
   marks: [
-    { type: "bar", data: bimodal, x: "v", fill: "#3987e5", opacity: 0.55, transform: { bin: { width: 0.4, reduce: "density" } }, label: "histogram" },
-    { type: "line", data: bimodal, x: "v", stroke: "#d95926", width: 2, transform: { bin: { width: 0.4, reduce: "density" } }, label: "frequency polygon" },
-    { type: "line", data: bimodal, x: "v", stroke: "#199e70", width: 2.5, transform: { density: true }, label: "KDE" },
+    { type: "bar", data: bimodal, x: "v", fill: BLUE, opacity: 0.55, transform: { bin: { width: 0.4, reduce: "density" } }, label: "histogram" },
+    { type: "line", data: bimodal, x: "v", stroke: ORANGE, width: 2, transform: { bin: { width: 0.4, reduce: "density" } }, label: "frequency polygon" },
+    { type: "line", data: bimodal, x: "v", stroke: AQUA, width: 2.5, transform: { density: true }, label: "KDE" },
     { type: "line", fn: { expr: "0.35*exp(-(x+1.2)^2/0.72)/(0.6*sqrt(2*pi)) + 0.65*exp(-(x-1.4)^2/1.62)/(0.9*sqrt(2*pi))", domain: [-4, 5] }, stroke: "#8b949e", dash: true, label: "true density", extent: false },
   ],
 });
@@ -311,9 +311,9 @@ const rollingEntry = mark("marks_rolling", "daily temperature", "dot marks of ra
   ylabel: "°C",
   marks: [
     { type: "dot", data: daily, x: "day", y: "temp", fill: "#8b949e", r: 2.2, opacity: 0.6, label: "daily" },
-    { type: "line", data: daily, x: "day", y: "temp", stroke: "#d95926", width: 2.5, transform: { window: { k: 15 } }, label: "15-day mean" },
-    { type: "line", data: daily, x: "day", y: "temp", stroke: "#3987e5", width: 2, dash: true, transform: { window: { k: 31, reduce: "median" } }, label: "31-day median" },
-    { type: "rule", y: +meanTemp.toFixed(2), stroke: "#199e70", dash: true, label: `mean ${meanTemp.toFixed(1)} °C` },
+    { type: "line", data: daily, x: "day", y: "temp", stroke: ORANGE, width: 2.5, transform: { window: { k: 15 } }, label: "15-day mean" },
+    { type: "line", data: daily, x: "day", y: "temp", stroke: BLUE, width: 2, dash: true, transform: { window: { k: 31, reduce: "median" } }, label: "31-day median" },
+    { type: "rule", y: +meanTemp.toFixed(2), stroke: AQUA, dash: true, label: `mean ${meanTemp.toFixed(1)} °C` },
   ],
 });
 
@@ -368,7 +368,7 @@ const barx = mark("marks_barx", "favourite language", "barX with the group trans
   xlabel: "answers",
   legend: false,
   marks: [
-    { type: "barX", data: answers, y: "language", fill: "#199e70", transform: { group: { sort: "desc" } } },
+    { type: "barX", data: answers, y: "language", fill: AQUA, transform: { group: { sort: "desc" } } },
     { type: "text", data: answers, y: "language", x: "x", text: "x", anchor: "lm", dx: 6, transform: { group: { sort: "desc" } } },
   ],
 });

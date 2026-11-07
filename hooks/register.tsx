@@ -58,7 +58,7 @@ const VIEW_TOOL = 'mcp__sciviz__view'
 const PLOT_TOOL = 'mcp__sciviz__plot'
 const OPEN_TOOL = 'mcp__sciviz__gallery_open'
 const CHART_TOOL = 'mcp__sciviz__chart'
-const CHART_KEYS = ['title', 'subtitle', 'xlabel', 'ylabel', 'x', 'y', 'series', 'marks', 'color', 'r', 'overlays', 'legend', 'x0', 'x1', 'ymin', 'ymax', 'sliders']
+const CHART_KEYS = ['title', 'subtitle', 'xlabel', 'ylabel', 'x', 'y', 'series', 'marks', 'color', 'r', 'overlays', 'legend', 'endLabels', 'x0', 'x1', 'ymin', 'ymax', 'sliders']
 // Resolved at session start (resolvePaths): ROOT holds deno/ (the plugin's own folder once installed,
 // or the projectDir option); RUN is per-user state (control files, frames, snapshots).
 let ROOT = ''
@@ -1068,7 +1068,7 @@ export const register: Register = (on, options) => {
             type: 'array',
             description: 'drawn in order after any series (fills and bars under lines, dots, rules and text). Strings in x or y make categories ' +
               '(x left to right, y top to bottom, in order of appearance; bars and rects take a slot each, 0.8 wide); fill strings make a palette legend ' +
-              '(at most 8 categories, in order of appearance), fill numbers a colormap with a colour bar (`color`)',
+              '(at most 7 categories, Okabe–Ito, in order of appearance), fill numbers a colormap with a colour bar (`color`)',
             items: {
               type: 'object',
               properties: {
@@ -1176,6 +1176,7 @@ export const register: Register = (on, options) => {
             },
           },
           legend: { type: 'boolean', description: 'default true (in the emptiest corner)' },
+          endLabels: { type: 'boolean', description: 'each labelled line\'s name at its right end (last visible point), in the right margin; default: on with 5 or more labelled lines' },
           sliders: { type: 'object', description: '{name: [min, max] | {min, max, step?, label?}}: in-frame sliders the user drags, each setting the fn param (expr params, or a named fn\'s order, lambda, tau, omega, zeta...) of that name in every series/mark; its value starts at the param\'s. state.sliders reports the values the user set' },
           x0: { type: ['number', 'null'], description: 'visible x window start, data units; null: all data' },
           x1: { type: ['number', 'null'] },

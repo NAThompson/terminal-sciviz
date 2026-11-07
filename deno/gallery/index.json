@@ -791,7 +791,7 @@
             2.190157682810952e-8
           ],
           "label": "residual",
-          "color": "#3987e5",
+          "color": "#56B4E9",
           "width": 1.2,
           "envelope": {
             "type": "cummin",
@@ -808,7 +808,7 @@
             40
           ],
           "label": "warm-up",
-          "color": "#d55181",
+          "color": "#CC79A7",
           "width": 1.5,
           "dash": true
         },
@@ -820,7 +820,7 @@
             0.000001
           ],
           "label": "target",
-          "color": "#199e70"
+          "color": "#009E73"
         },
         {
           "kind": "hline",
@@ -828,7 +828,7 @@
             0.00001
           ],
           "label": "tolerance 10⁻⁵",
-          "color": "#e66767",
+          "color": "#D55E00",
           "dash": true
         },
         {
@@ -1659,7 +1659,7 @@
             0.09420413083865851
           ],
           "label": "measured",
-          "color": "#d95926"
+          "color": "#E69F00"
         },
         {
           "fn": {
@@ -1672,7 +1672,7 @@
             ]
           },
           "label": "fit exp(−𝑡/𝜏) cos 𝜔𝑡",
-          "color": "#e66767",
+          "color": "#D55E00",
           "width": 2
         },
         {
@@ -1789,7 +1789,7 @@
       "y": {
         "scale": "log"
       },
-      "nanColor": "#e66767",
+      "nanColor": "#D55E00",
       "series": [
         {
           "y": [
@@ -5042,7 +5042,7 @@
           ],
           "bars": true,
           "label": "observed",
-          "color": "#3987e5"
+          "color": "#56B4E9"
         },
         {
           "fn": {
@@ -5055,7 +5055,7 @@
             ]
           },
           "label": "Poisson fit, 𝜆̂ = 4.27",
-          "color": "#d95926",
+          "color": "#E69F00",
           "width": 2
         },
         {
@@ -5090,7 +5090,7 @@
             2.129330060093656
           ],
           "markers": "only",
-          "color": "#d95926",
+          "color": "#E69F00",
           "legend": false
         }
       ]
@@ -5120,7 +5120,7 @@
             ]
           },
           "label": "λ^𝑥 e^−λ / Γ(𝑥 + 1)",
-          "color": "#3987e5",
+          "color": "#56B4E9",
           "width": 2
         },
         {
@@ -5135,7 +5135,7 @@
             ]
           },
           "label": "normal density",
-          "color": "#d95926",
+          "color": "#E69F00",
           "dash": true
         },
         {
@@ -5150,7 +5150,7 @@
             ]
           },
           "label": "normal CDF / 5",
-          "color": "#199e70"
+          "color": "#009E73"
         }
       ]
     },
@@ -5177,7 +5177,7 @@
             ]
           },
           "label": "exp(−𝑡/τ) cos ω𝑡",
-          "color": "#3987e5",
+          "color": "#56B4E9",
           "width": 2
         },
         {
@@ -5543,7 +5543,7 @@
             "band": 0.05
           },
           "label": "ECDF",
-          "color": "#3987e5"
+          "color": "#56B4E9"
         },
         {
           "fn": {
@@ -5557,7 +5557,7 @@
             ]
           },
           "label": "true CDF Φ(ln 𝑥 / σ)",
-          "color": "#d95926",
+          "color": "#E69F00",
           "dash": true
         }
       ]
@@ -7917,7 +7917,7 @@
             ]
           },
           "x": "v",
-          "fill": "#3987e5",
+          "fill": "#56B4E9",
           "opacity": 0.55,
           "transform": {
             "bin": {
@@ -8534,7 +8534,7 @@
             ]
           },
           "x": "v",
-          "stroke": "#d95926",
+          "stroke": "#E69F00",
           "width": 2,
           "transform": {
             "bin": {
@@ -9151,7 +9151,7 @@
             ]
           },
           "x": "v",
-          "stroke": "#199e70",
+          "stroke": "#009E73",
           "width": 2.5,
           "transform": {
             "density": true
@@ -10674,7 +10674,7 @@
           },
           "x": "day",
           "y": "temp",
-          "stroke": "#d95926",
+          "stroke": "#E69F00",
           "width": 2.5,
           "transform": {
             "window": {
@@ -11423,7 +11423,7 @@
           },
           "x": "day",
           "y": "temp",
-          "stroke": "#3987e5",
+          "stroke": "#56B4E9",
           "width": 2,
           "dash": true,
           "transform": {
@@ -11437,7 +11437,7 @@
         {
           "type": "rule",
           "y": 11.06,
-          "stroke": "#199e70",
+          "stroke": "#009E73",
           "dash": true,
           "label": "mean 11.1 °C"
         }
@@ -14809,7 +14809,7 @@
             }
           ],
           "y": "language",
-          "fill": "#199e70",
+          "fill": "#009E73",
           "transform": {
             "group": {
               "sort": "desc"
@@ -31170,7 +31170,7 @@
   {
     "id": "complex/rational",
     "section": "complex",
-    "title": "(z² − 1)(z − 2 − i)²/(z² + 2 + 2i)",
+    "title": "(𝑧² − 1)(𝑧 − 2 − 𝑖)²/(𝑧² + 2 + 2𝑖)",
     "description": "phase and amplitude: hue arg f (Twilight), opacity log |f|",
     "renderer": "complex.ts",
     "control": {
@@ -31184,7 +31184,7 @@
   {
     "id": "complex/cubic_surface",
     "section": "complex",
-    "title": "z³ − 1",
+    "title": "𝑧³ − 1",
     "description": "surface: height log |f| (z stretched by 0.5), colour arg f (Twilight)",
     "renderer": "surface.ts",
     "control": {

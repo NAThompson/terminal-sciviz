@@ -91,7 +91,7 @@ check("line with z over 9 ids: one colour, one legend entry at most", () => {
   return (s.length === 9 && new Set(s.map((c) => c.color)).size === 1 && s[0].color === PALETTE[0] && s.every((c) => !c.legend)) || JSON.stringify(s.map((c) => [c.color, c.legend]));
 });
 check("line with z over 3 ids: palette colours", () => compile([{ type: "line", data: { t: ids.t.slice(0, 9), y: ids.y.slice(0, 9), id: ids.id.slice(0, 9) }, x: "t", y: "y", z: "id" }]).series.map((c) => c.color).join() === PALETTE.slice(0, 3).join());
-check("fill over 9 categories still throws", () => throws(() => compile([{ type: "line", data: ids, x: "t", y: "y", fill: "id" }]), /the palette has 8/));
+check("fill over 9 categories still throws", () => throws(() => compile([{ type: "line", data: ids, x: "t", y: "y", fill: "id" }]), new RegExp(`the palette has ${PALETTE.length}`)));
 
 // 14: window keeps fill as z (hover shows the category once; a later transform keeps the fill)
 const win = { x: [0, 1, 2, 3, 4, 5, 0, 1, 2, 3, 4, 5], y: [1, 2, 3, 4, 5, 6, 6, 5, 4, 3, 2, 1], g: [..."aaaaaabbbbbb"] };
@@ -102,7 +102,7 @@ check("window k = 5 with fill: the category once in the tip", () => {
 check("window then density with fill: the fill kept (still a fill: 9 categories throw)", () => {
   const s = compile([{ type: "area", data: win, x: "x", y: "y", fill: "g", transform: { window: { k: 5 }, density: true } }]).series;
   return (s.length === 2 && s[0].color === PALETTE[0] && s[1].color === PALETTE[1] &&
-    throws(() => compile([{ type: "area", data: ids, x: "t", y: "y", fill: "id", transform: { window: { k: 2 }, density: true } }]), /the palette has 8/)) || JSON.stringify(s.map((c) => c.color));
+    throws(() => compile([{ type: "area", data: ids, x: "t", y: "y", fill: "id", transform: { window: { k: 2 }, density: true } }]), new RegExp(`the palette has ${PALETTE.length}`))) || JSON.stringify(s.map((c) => c.color));
 });
 
 // 6: CSV (RFC 4180) and TSV

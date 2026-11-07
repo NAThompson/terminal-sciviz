@@ -33,8 +33,8 @@ import { boxStats, closestSpacing, ecdf, histogram, linreg, qq, sortedFinite } f
 import { type ColorBar, type Columns, type Compiled, compileMarks, type Mark, type Prims, type Scales } from "./lib/marks.ts";
 import { colormapRgb } from "./lib/colormaps.ts";
 
-// GitHub Dark (terminal theme), dataviz palette
-export const PALETTE = ["#3987e5", "#d95926", "#199e70", "#c98500", "#d55181", "#008300", "#9085e9", "#e66767"];
+// GitHub Dark (terminal theme), Okabe–Ito palette (colour-blind safe)
+export const PALETTE = ["#56B4E9", "#E69F00", "#009E73", "#F0E442", "#0072B2", "#D55E00", "#CC79A7"]; // Okabe–Ito
 export const INK = "#c9d1d9", INK2 = "#8b949e", GRID = "#262c36";
 const SURFACE = "#101216", ZERO = "#484f58", HOVER_RING = "#e6edf3";
 const LABEL_FILL: Rgba = [20 / 255 * (240 / 255), 24 / 255 * (240 / 255), 30 / 255 * (240 / 255), 240 / 255];
@@ -114,8 +114,9 @@ export const DEFAULTS = {
   color: {} as NonNullable<Scales["color"]>, // marks' colour scale
   r: {} as NonNullable<Scales["r"]>, // marks' radius scale
   legend: true,
+  endLabels: null as boolean | null, // each labelled line's name at its right end; null: with 5 or more
   zeroLine: true,
-  nanColor: "#e66767",
+  nanColor: "#6e7681", // neutral: no hue to mistake for a series
   x0: null as number | null, // values (not axis space); null: all data
   x1: null as number | null,
   ymin: null as number | null, // null: fit what is visible, 8% margin (in axis space)
@@ -302,15 +303,15 @@ function resolveSeries(ctl: Control): Series[] {
   const out: Series[] = [];
   let auto = 0, boxes = 0;
   const manyStats = series.filter((sp) => sp.stat).length > 1;
-  const nextColor = () => PALETTE[auto++ % PALETTE.length];
   for (const given of series) {
-    const color = given.color ?? nextColor();
+    const cycled = !given.color && auto >= PALETTE.length; // past the palette: dashed
+    const color = given.color ?? PALETTE[auto++ % PALETTE.length];
     for (const spec of expandStat(given, color, statOf(given)?.type === "box" ? boxes++ : 0, manyStats) as Compiled[]) {
       const base = {
         label: spec.label ?? "",
         color,
         width: spec.width ?? 1.5,
-        dash: Boolean(spec.dash),
+        dash: Boolean(spec.dash) || cycled,
         markers: spec.markers ?? false,
         bars: 0,
         opacity: spec.opacity ?? 1,
@@ -888,7 +889,7 @@ export class LinePlot implements ServeRenderer<Control> {
       throw new Error("x1 must be above x0");
     }
     // Geometry: the view and the curve layer; chrome: grid, text, references, legend
-    const geomKey = JSON.stringify([this.dataGen, w, h, x0, x1, ctl.ymin, ctl.ymax, ctl.overlays, Boolean(ctl.ylabel), Boolean(ctl.xlabel), this.sliderDefs.length]);
+    const geomKey = JSON.stringify([this.dataGen, w, h, x0, x1, ctl.ymin, ctl.ymax, ctl.overlays, Boolean(ctl.ylabel), Boolean(ctl.xlabel), this.sliderDefs.length, ctl.endLabels]);
     const chromeKey = JSON.stringify([geomKey, ctl.legend, ctl.title, ctl.subtitle, ctl.xlabel, ctl.ylabel, ctl.zeroLine, ctl.nanColor, this.sliderDefs, ctl.sliderHot]);
     if (geomKey !== this.geomKey) {
       this.setGeometry(ctl, w, h, x0, x1, tx, ty);
@@ -906,7 +907,9 @@ export class LinePlot implements ServeRenderer<Control> {
     const F = this.fonts(s);
     const T = Math.round((ctl.ylabel ? 74 : 56) * s) + (this.sliderDefs.length ? sliderHeight(F.label, s) + Math.round(14 * s) : 0); // sliders: a row under the title
     const B = h - Math.round((ctl.xlabel ? 62 : 40) * s);
-    const R = w - Math.round(24 * s);
+    const ends = this.endLabelled(ctl); // their labels in the right margin
+    const endW = ends.length ? Math.round(24 * s) + Math.max(...ends.map((g) => this.font.measure(F.label, this.series[g[0]].label))) : 0;
+    const R = w - Math.round((ends.length ? 12 : 24) * s) - Math.min(endW, Math.round(0.35 * w));
 
     // Dense samples of generators over (at least) the window (`ensureDense`)
     const step = denseStep(w, h, x0, x1);
@@ -1311,8 +1314,66 @@ export class LinePlot implements ServeRenderer<Control> {
     }
 
     if (ctl.legend) this.legend(top, ctl);
+    this.endLabels(top, this.endLabelled(ctl));
     if (this.colorbar) this.colorBar(q, this.colorbar);
     return [q, top];
+  }
+
+  /** Labelled line series (indices), one group per label and colour, when `endLabels` (default: 5 or more). */
+  private endLabelled(ctl: Control): number[][] {
+    const groups = new Map<string, number[]>();
+    this.series.forEach((sr, si) => {
+      if (!sr.legend || !sr.label || !(sr.curves.length || sr.gen)) return;
+      const k = JSON.stringify([sr.label, sr.color]);
+      groups.set(k, [...(groups.get(k) ?? []), si]);
+    });
+    return (ctl.endLabels ?? groups.size >= 5) ? [...groups.values()] : [];
+  }
+
+  /** Each group's label in ink, after a swatch, in the right margin at the height of its last
+   * visible point; sorted by it and pushed apart to a line each, inside the plot's height. */
+  private endLabels(q: Quads, groups: number[][]): void {
+    const v = this.view;
+    const s = v.scale;
+    const [, T, R, B] = v.plot;
+    const F = this.fonts(s).label;
+    const lh = F.ascent + F.descent + Math.round(2 * s), half = (F.ascent + F.descent) / 2;
+    const inView = (t: number, y: number) => t >= v.x0 && t <= v.x1 && y >= v.y0 && y <= v.y1;
+    let items = groups.flatMap((g) => {
+      let end: [number, number] | null = null; // axis space: the rightmost visible point
+      const take = (t: number, y: number | null) => { if (y !== null && inView(t, y) && (!end || t > end[0])) end = [t, y]; };
+      for (const si of g) {
+        const d = this.series[si].gen ? this.dense.get(si) : undefined;
+        for (const p of d ? [d.run] : this.series[si].runs) {
+          take(v.x1, pieceAt(p, v.x1));
+          for (let i = p.xw.length - 1; i >= 0; i -= 1) {
+            if (p.xw[i] > v.x1) continue;
+            if (p.xw[i] < v.x0 || (end && p.xw[i] <= end[0])) break;
+            if (inView(p.xw[i], p.yw[i])) { take(p.xw[i], p.yw[i]); break; }
+          }
+        }
+      }
+      const sr = this.series[g[0]];
+      return end ? [{ sr, y: v.py(end[1]) }] : [];
+    }).sort((a, b) => a.y - b.y);
+    const [top, bottom] = [T + half, B - half];
+    const fit = Math.max(1, Math.floor((bottom - top) / lh) + 1); // more than fit: an even selection
+    if (items.length > fit) items = Array.from({ length: fit }, (_, k) => items[fit > 1 ? Math.round((k * (items.length - 1)) / (fit - 1)) : 0]);
+    for (let i = 0; i < items.length; i += 1) items[i].y = Math.max(items[i].y, i ? items[i - 1].y + lh : top);
+    for (let i = items.length - 1; i >= 0; i -= 1) items[i].y = Math.min(items[i].y, i + 1 < items.length ? items[i + 1].y - lh : bottom);
+    const x = R + Math.round(6 * s), sw = Math.round(12 * s), tx0 = x + sw + Math.round(6 * s), room = v.w - tx0 - Math.round(4 * s);
+    for (const { sr, y } of items) {
+      const lw = Math.max(1, Math.round(sr.width * s));
+      const d = sr.dash ? Math.round(5 * s) : sw; // dashed: two dashes
+      for (let a = 0; a < sw; a += d + Math.round(2 * s)) q.rect(x + a, Math.round(y - lw / 2), Math.min(d, sw - a), lw, premul(sr.color, sr.opacity));
+      let text = sr.label; // too long for the margin: ellipsized
+      if (this.font.measure(F, text) > room) {
+        const cs = [...text]; // code points
+        while (cs.length && this.font.measure(F, cs.join("") + "…") > room) cs.pop();
+        text = cs.join("") + "…";
+      }
+      q.text(text, tx0, y, F, premul(INK), "lm");
+    }
   }
 
   /** Filled triangle, apex on the edge at (x, edge), pointing out, `half` wide each side. */

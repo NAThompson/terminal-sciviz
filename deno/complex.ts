@@ -66,7 +66,7 @@ export const FUNCTIONS: Record<string, ComplexFunction> = {
     },
     domain: [-2.5, 2.5, -2.5, 2.5],
     title: "(z^2 − 1)(z − 2 − i)^2 / (z^2 + 2 + 2i)",
-    fancy: "(z² − 1)(z − 2 − i)²/(z² + 2 + 2i)",
+    fancy: "(𝑧² − 1)(𝑧 − 2 − 𝑖)²/(𝑧² + 2 + 2𝑖)",
   },
   // the gallery's complex/cubic_surface
   "z^3-1": {
@@ -74,13 +74,14 @@ export const FUNCTIONS: Record<string, ComplexFunction> = {
     f: (z) => sub(mul(mul(z, z), z), [1, 0]),
     domain: [-2, 2, -2, 2],
     title: "z^3 − 1",
-    fancy: "z³ − 1",
+    fancy: "𝑧³ − 1",
   },
   sin: {
     id: 2,
     f: ([x, y]) => [Math.sin(x) * Math.cosh(y), Math.cos(x) * Math.sinh(y)],
     domain: [-2 * Math.PI, 2 * Math.PI, -2, 2],
     title: "sin z",
+    fancy: "sin 𝑧",
   },
   // exp(2z) − z³, a classic domain-colouring example
   "exp-cubic": {
@@ -88,7 +89,7 @@ export const FUNCTIONS: Record<string, ComplexFunction> = {
     f: (z) => sub(cexp(add(z, z)), mul(mul(z, z), z)),
     domain: [-2, 2, -2, 2],
     title: "exp(2z) − z^3",
-    fancy: "exp(2z) − z³",
+    fancy: "exp(2𝑧) − 𝑧³",
   },
 };
 
@@ -557,7 +558,7 @@ export class ComplexPlot implements ServeRenderer<Control> {
         q.text(fmtTick(y, ydec), L - tick - Math.round(6 * s), Y + 0.5, F.tick, premul(INK2), "rm");
       }
     }
-    const re = this.glyphs(F.sub, "ℜz", "Re z"), im = this.glyphs(F.sub, "ℑz", "Im z");
+    const re = this.glyphs(F.sub, "ℜ𝑧", "Re z"), im = this.glyphs(F.sub, "ℑ𝑧", "Im z");
     q.text(re, (L + R) / 2, v.h - Math.round(10 * s), F.sub, premul(INK), "mb");
     q.text(im, L - tick - Math.round(6 * s), T - Math.round(10 * s), F.sub, premul(INK), "rb");
 
@@ -570,7 +571,7 @@ export class ComplexPlot implements ServeRenderer<Control> {
     const [cx, cy, r] = v.wheel;
     const pi = this.glyphs(F.tick, "π", "pi");
     const g = Math.round(6 * s);
-    q.text("arg f", cx, T - Math.round(2 * s), F.sub, premul(INK), "mt");
+    q.text(this.glyphs(F.sub, "arg 𝑓", "arg f"), cx, T - Math.round(2 * s), F.sub, premul(INK), "mt");
     q.text("0", cx + r + g, cy + 0.5, F.tick, premul(INK2), "lm");
     q.text(`${pi}/2`, cx, cy - r - g, F.tick, premul(INK2), "mb");
     q.text(`±${pi}`, cx - r - g, cy + 0.5, F.tick, premul(INK2), "rm");
@@ -578,9 +579,9 @@ export class ComplexPlot implements ServeRenderer<Control> {
     let y = cy + r + Math.round(34 * s);
     const lh = F.tick.ascent + F.tick.descent + Math.round(4 * s);
     const rows: [string, string][] = colouring === "phase"
-      ? [["opaque: arg f only", ""]]
+      ? [["opaque: arg 𝑓 only", ""]]
       : [
-        [`|f|, ${v.log ? "log" : "linear"}, centre → rim`, ""],
+        [`|𝑓|, ${v.log ? "log" : "linear"}, centre → rim`, ""],
         ["centre", fmtNum(v.amp[0], 3)],
         ["rim", fmtNum(v.amp[1], 3)],
       ];
@@ -649,16 +650,16 @@ export class ComplexPlot implements ServeRenderer<Control> {
 
     const font = this.fonts(s).label;
     const pi = this.glyphs(font, "π", "pi");
-    const im = (x: number) => `${x < 0 ? "−" : "+"} ${fmtNum(Math.abs(x), 5)}i`;
-    const rows: [string, string][] = [["z", `${fmtNum(info.z[0], 5)} ${im(info.z[1])}`]];
+    const im = (x: number) => `${x < 0 ? "−" : "+"} ${fmtNum(Math.abs(x), 5)}𝑖`;
+    const rows: [string, string][] = [["𝑧", `${fmtNum(info.z[0], 5)} ${im(info.z[1])}`]];
     if (info.f) {
       rows.push(
-        ["f", `${fmtNum(info.f[0], 4)} ${im(info.f[1]).replace(/(\d)(\.\d{3})\d+/, "$1$2")}`],
-        ["|f|", fmtNum(info.amplitude!, 5)],
-        ["arg f", `${fmtNum(info.phase!, 4)} (${fmtNum(info.phase! / Math.PI, 3)}${pi})`],
+        ["𝑓", `${fmtNum(info.f[0], 4)} ${im(info.f[1]).replace(/(\d)(\.\d{3})\d+/, "$1$2")}`],
+        ["|𝑓|", fmtNum(info.amplitude!, 5)],
+        ["arg 𝑓", `${fmtNum(info.phase!, 4)} (${fmtNum(info.phase! / Math.PI, 3)}${pi})`],
       );
     } else {
-      rows.push(["f", "outside the grid"]);
+      rows.push(["𝑓", "outside the grid"]);
     }
     const gapRow = Math.round(3 * s);
     const lh = font.ascent + font.descent + gapRow;

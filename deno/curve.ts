@@ -38,7 +38,7 @@ import { main, type Pending, type Renderer as ServeRenderer } from "./lib/serve.
 import { CURVES, curvePoints } from "./lib/generators.ts";
 import { drawSliders, type Param, resolveSliders, type Slider, type SliderDef, sliderHeight } from "./lib/sliders.ts";
 
-const BLUE = "#3987e5", ORANGE = "#d95926", MAGENTA = "#d55181";
+const BLUE = "#56B4E9", ORANGE = "#E69F00", MAGENTA = "#CC79A7"; // Okabe–Ito (line.ts PALETTE)
 const INK = "#c9d1d9", INK2 = "#8b949e", GRID = "#262c36", ZERO = "#484f58", SURFACE = "#101216", HOVER_RING = "#e6edf3";
 const LABEL_FILL: Rgba = [20 / 255 * (240 / 255), 24 / 255 * (240 / 255), 30 / 255 * (240 / 255), 240 / 255];
 const LABEL_BORDER: Rgba = [48 / 255, 54 / 255, 61 / 255, 1];
