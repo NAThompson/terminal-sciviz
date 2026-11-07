@@ -61,7 +61,7 @@ const OPEN_TOOL = 'mcp__sciviz__gallery_open'
 // or the projectDir option); RUN is per-user state (control files, frames, snapshots).
 let ROOT = ''
 let RUN = ''
-let DENO = 'deno'
+let DENO = '' // absolute path, or '' when none was found
 const MAX_FRAME_PX = 4096 // ImageSource limit for shm/file frames
 const DRAG_SCALE = 0.55 // resolution while dragging (faster frames); full Retina again on release
 const VIEW_ASPECT = 16 / 10 // pixels, width / height
@@ -338,7 +338,10 @@ async function drawView($: any, e: any, id: string, kind: Kind) {
   void startRenderer($, kind)
   // A shm frame is read once, so a (re)mounted view starts from its saved PNG and asks for a fresh frame
   const png = viewPng(id)
-  const source = (await $.fs.exists(png)) ? { file: png, format: 'png', generation: saved[png] ?? 0 } : { rgba: BLANK, width: 1, height: 1 }
+  const havePng = await $.fs.exists(png)
+  const problem = setupError || (!havePng && !running[kind] ? lastError[kind] : '')
+  if (problem) return <Text color="red">sciviz: {problem}</Text>
+  const source = havePng ? { file: png, format: 'png', generation: saved[png] ?? 0 } : { rgba: BLANK, width: 1, height: 1 }
   if (running[kind]) void writeControl($, kind)
   return (
     <Box width={cols} height={rows}>
@@ -488,6 +491,9 @@ async function onPointer($: any, kind: Kind, ev: any) {
   const interaction = viewInfo[view.live]?.interaction ?? legacyInteraction(kind)
   const cols = ev.columns || view.cols, rows = ev.rows || view.rows
   const x = ev.fine?.x ?? ev.x + 0.5, y = ev.fine?.y ?? ev.y + 0.5
+  // a move with no button held while a drag is open: its `up` was lost (outside the view, a remount).
+  // End the drag, or every hover would keep orbiting the camera and re-rendering.
+  if (view.drag && ev.type === 'move' && !ev.button) ev = { ...ev, type: 'up' }
   // For the native overlay (overlay/*.ts): where the pointer is in the view, in cells; the
   // overlay pairs it with the global mouse position to place itself exactly over the view.
   void writeOverlay($, JSON.stringify({ seq: ++overlaySeq, type: ev.type, x, y, cols, rows,
@@ -575,6 +581,8 @@ function showView($: any, e: any, kind: Kind, keys: string[], replace?: Ctl, ent
 }
 async function showViewNow($: any, e: any, kind: Kind, keys: string[], replace?: Ctl, entry?: Entry) {
   const input = e as Ctl
+  await checkDeno($)
+  if (setupError) return { result: JSON.stringify({ snapshot: null, error: setupError }) }
   if (replace) KINDS[kind].ctl = { ...replace, ...BASE, rev: KINDS[kind].ctl.rev, width: view.pxW, height: view.pxH }
   const ctl = KINDS[kind].ctl
   for (const k of keys) if (input[k] !== undefined) ctl[k] = input[k]
@@ -605,6 +613,8 @@ async function showViewNow($: any, e: any, kind: Kind, keys: string[], replace?:
 /** /sciviz-view and /sciviz-plot: the output row about to be drawn becomes the live view. */
 async function openView($: any, e: any, kind: Kind, field: string, options: string[]) {
   const arg = String(e.args ?? '').trim()
+  await checkDeno($)
+  if (setupError) return { text: `sciviz: ${setupError}` }
   if (options.includes(arg)) KINDS[kind].ctl[field] = arg
   const tok = `v${++openSeq}`
   opens[tok] = { kind, interaction: legacyInteraction(kind), home: { ...KINDS[kind].ctl } }
@@ -639,8 +649,10 @@ async function openEntry($: any, e: any) {
   if (found.length !== 1) {
     return { text: found.length
       ? `sciviz: "${id}" matches ${found.map((x) => x.id).join(', ')}; which one?`
-      : `sciviz: no gallery entry "${id}". /sciviz-gallery [lines|curves|complex] lists them.` }
+      : `sciviz: no gallery entry "${id}". /sciviz-gallery [${SECTIONS.join('|')}] lists them.` }
   }
+  await checkDeno($)
+  if (setupError) return { text: `sciviz: ${setupError}` }
   const entry = found[0]
   const kind = galleryKind(entry.renderer)
   KINDS[kind].ctl = { ...entry.control, ...BASE, rev: KINDS[kind].ctl.rev, width: view.pxW, height: view.pxH }
@@ -656,6 +668,54 @@ async function openEntry($: any, e: any) {
 
 /** Where the renderers, the deno binary and the state live; tried in order, first that exists. */
 let setupError = '' // shown in views and tool results when the renderers can't run
+const NO_DENO = 'Deno is not installed: install Deno 2.x (`brew install deno`, or see https://deno.com) or set the plugin\'s deno option'
+
+const denoSearch = { home: '', wanted: '' }
+let installing: Promise<void> | null = null
+
+/** The deno binary: the option, else PATH, else the usual install locations; '' when none exists. */
+async function findDeno($: any) {
+  const { home, wanted } = denoSearch
+  if (wanted) return wanted.startsWith('/') && (await $.fs.exists(wanted)) ? wanted : ''
+  const onPath = (await $.process.run(['/bin/sh', '-c', 'command -v deno || true'])).stdout.trim()
+  for (const d of [onPath, `${home}/.deno/bin/deno`, '/opt/homebrew/bin/deno', '/usr/local/bin/deno', '/usr/bin/deno'])
+    if (d.startsWith('/') && (await $.fs.exists(d))) return d
+  return ''
+}
+
+/** Before each view: is deno (still) there? Find it again if it moved; else install it or say why not. */
+async function checkDeno($: any) {
+  if (installing || (DENO.startsWith('/') && (await $.fs.exists(DENO)))) return
+  DENO = await findDeno($)
+  if (DENO) { if (ROOT) setupError = ''; return } // with ROOT found, the only setup error is deno's
+  setupError = denoSearch.wanted ? `deno not found at ${denoSearch.wanted} (the plugin's deno option)` : NO_DENO
+  if (!denoSearch.wanted) installing = installDeno($, denoSearch.home).finally(() => { installing = null })
+}
+
+/** No deno anywhere: install it with Homebrew when that is there (in the background; views say so meanwhile). */
+async function installDeno($: any, home: string) {
+  const brews = ['/opt/homebrew/bin/brew', '/usr/local/bin/brew', '/home/linuxbrew/.linuxbrew/bin/brew', `${home}/.linuxbrew/bin/brew`]
+  let brew = ''
+  for (const b of brews) if (await $.fs.exists(b)) { brew = b; break }
+  if (!brew) return
+  setupError = 'installing Deno with Homebrew (`brew install deno`)…'
+  $.ui.toast('sciviz: Deno not found, installing it with Homebrew…')
+  try {
+    const r = await $.process.run([brew, 'install', 'deno'], { env: { NONINTERACTIVE: '1', HOMEBREW_NO_AUTO_UPDATE: '1' }, timeoutMs: 600_000 })
+    const deno = brew.replace(/brew$/, 'deno')
+    if (r.exitCode === 0 && (await $.fs.exists(deno))) {
+      DENO = deno
+      setupError = ''
+      $.ui.toast('sciviz: Deno installed; views are ready')
+      return
+    }
+    setupError = `\`brew install deno\` failed (exit ${r.exitCode}): ${String(r.stderr ?? '').trim().split('\n').slice(-2).join(' ')}. ${NO_DENO}`
+  } catch (err) {
+    setupError = `\`brew install deno\` failed (${(err as Error)?.message ?? err}). ${NO_DENO}`
+  }
+  $.ui.toast(`sciviz: ${setupError}`)
+}
+
 async function resolvePaths($: any, options: Record<string, unknown>) {
   const sh = async (cmd: string) => (await $.process.run(['/bin/sh', '-c', cmd])).stdout.trim()
   const home = await sh('printf %s "$HOME"')
@@ -666,15 +726,10 @@ async function resolvePaths($: any, options: Record<string, unknown>) {
     `${home}/terminal-sciviz`].filter(Boolean).map(expand)
   ROOT = ''
   for (const r of roots) if (await $.fs.exists(`${r}/deno/surface.ts`)) { ROOT = r; break }
-  // deno: the option, else PATH, else the usual install locations
-  const wanted = expand(String(options.deno ?? ''))
-  const found = wanted || (await sh('command -v deno || true'))
-  const candidates = [found, `${home}/.deno/bin/deno`, '/opt/homebrew/bin/deno', '/usr/local/bin/deno', '/usr/bin/deno'].filter(Boolean)
-  DENO = ''
-  for (const d of candidates) if (await $.fs.exists(d)) { DENO = d; break }
-  setupError = !ROOT ? `renderers not found (looked in ${roots.join(', ')}); set the plugin's projectDir option`
-    : !DENO ? (wanted ? `deno not found at ${wanted}` : 'deno not found on PATH or in ~/.deno/bin, Homebrew, /usr/local, /usr/bin: install Deno 2.x (https://deno.com) or set the plugin\'s deno option')
-    : ''
+  denoSearch.home = home
+  denoSearch.wanted = expand(String(options.deno ?? ''))
+  setupError = !ROOT ? `renderers not found (looked in ${roots.join(', ')}); set the plugin's projectDir option` : ''
+  if (ROOT) await checkDeno($)
   if (setupError) $.ui.log(`sciviz: ${setupError}`, { to: 'debug' })
   // per-session state: two Claude sessions never share controls or frames
   const session = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
@@ -691,7 +746,7 @@ export const register: Register = (on, options) => {
   on('command.run', { command: 'sciviz-open' }, ($, e) => openEntry($, e))
   on('command.run', { command: 'sciviz-gallery' }, async ($, e) => {
     const section = String((e as any).args ?? '').trim() || 'lines'
-    if (!SECTIONS.includes(section)) return { text: `sciviz: sections are ${SECTIONS.join(', ')}` }
+    if (!SECTIONS.includes(section)) return openEntry($, e) // an entry id: open it, as /sciviz-open does
     const ids = (await entries($)).filter((x) => x.section === section).map((x) => x.id)
     return { text: `${section}: ${ids.join('  ')}` }
   })
@@ -699,7 +754,7 @@ export const register: Register = (on, options) => {
   on('ui.render', { component: 'CommandOutput' }, async ($, e, next) => {
     const command = (e.props as any).command
     if (e.surface !== 'terminal') return next(e)
-    if (command === 'sciviz-gallery') { // the section's contact sheet, then its entry ids
+    if (command === 'sciviz-gallery' && SECTIONS.includes(String((e.props as any).args ?? '').trim() || 'lines')) { // the section's contact sheet, then its entry ids
       const { Box, Image, Text } = $.ui.resolve(e) as any
       const section = String((e.props as any).args ?? '').trim() || 'lines'
       const png = `${ROOT}/docs/contact_${section}.png`
@@ -715,9 +770,10 @@ export const register: Register = (on, options) => {
         </Box>
       )
     }
-    if (command !== 'sciviz-view' && command !== 'sciviz-plot' && command !== 'sciviz-open') return next(e)
+    if (command !== 'sciviz-view' && command !== 'sciviz-plot' && command !== 'sciviz-open' && command !== 'sciviz-gallery') return next(e)
     const id = String(e.requestId)
     const tok = /#(v\d+)\b/.exec(String((e.props as any).text ?? ''))?.[1]
+    if (!tok && !kindOf[id]) return next(e) // a message (setup error, "which one?"), not a view: show its text
     const open = tok ? opens[tok] : undefined
     if (open && !open.bound && !kindOf[id]) { // the row this very command produced: bind it once
       open.bound = id
@@ -769,7 +825,7 @@ export const register: Register = (on, options) => {
     await resolvePaths($, options ?? {})
     await $.command.register({ name: 'sciviz-view', description: 'Live view inline: /sciviz-view [wave|torus|sphere|wave-test] or a gallery entry (e.g. lines/pchip_blocks, or just blocks)' })
     await $.command.register({ name: 'sciviz-plot', description: 'Live GPU PCHIP plot inline: /sciviz-plot [bumps|runge|step|blocks]' })
-    await $.command.register({ name: 'sciviz-gallery', description: 'Gallery contact sheet: /sciviz-gallery [lines|curves|complex]' })
+    await $.command.register({ name: 'sciviz-gallery', description: 'Gallery contact sheet: /sciviz-gallery [lines|curves|complex|volumes], or an entry id to open it' })
     await $.command.register({ name: 'sciviz-open', description: 'Open a gallery entry as a live view: /sciviz-open lines/residual' })
     const ids = (await entries($)).map((x) => x.id)
     await $.tool.register({

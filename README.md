@@ -31,7 +31,8 @@ snapshot of exactly what you see.
 
 - A terminal with the kitty graphics protocol. Developed and tested in [Ghostty](https://ghostty.org);
   [kitty](https://sw.kovidgoyal.net/kitty/) implements the same protocol but is untested.
-- [Deno](https://deno.com) 2.x, for its built-in WebGPU. At runtime that's all: no npm packages, no other
+- [Deno](https://deno.com) 2.x, for its built-in WebGPU. If it isn't installed and Homebrew is, the plugin
+  runs `brew install deno` itself the first time a session starts. At runtime that's all: no npm packages, no other
   services. (Regenerating the bundled font atlas or colour-map tables uses Python and npm tooling; the
   results are committed, so you never need it to use the plugin.)
 - Claude Code **2.1.287 or later** (terminal mods); the `claude plugin install` shell shortcut needs 2.1.292+.
@@ -42,10 +43,14 @@ snapshot of exactly what you see.
 At the prompt of a Claude Code session:
 
 ```
-/plugin install sciviz --marketplace NAThompson/terminal-sciviz
+/plugin install sciviz --marketplace https://github.com/NAThompson/terminal-sciviz.git
 ```
 
-From a shell: `claude plugin install sciviz --marketplace NAThompson/terminal-sciviz`.
+From a shell: `claude plugin install sciviz --marketplace https://github.com/NAThompson/terminal-sciviz.git`.
+
+The full `https://` URL clones the public repository anonymously, so no GitHub account or SSH key is
+needed. (The short form `NAThompson/terminal-sciviz` tries SSH first, which fails inside a session on
+machines without a GitHub SSH key.)
 
 Then ask Claude to show you something (“plot the Lorenz attractor”, “show the gallery”), or run
 `/sciviz-gallery lines` and `/sciviz-view lorenz`.
