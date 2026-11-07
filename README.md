@@ -28,8 +28,9 @@ snapshot of exactly what you see.
 
 ## Requirements
 
-- A terminal with the kitty graphics protocol. Developed and tested in [Ghostty](https://ghostty.org);
-  [kitty](https://sw.kovidgoyal.net/kitty/) implements the same protocol but is untested.
+- [Ghostty](https://ghostty.org) (developed and tested there) or [kitty](https://sw.kovidgoyal.net/kitty/).
+  **Terminal.app and iTerm2 aren't supported**: views show a one-line note instead of the picture, and Claude
+  is told to describe them in words. Inside tmux, turn on `allow-passthrough` and `focus-events`.
 - [Deno](https://deno.com) 2.x, for its built-in WebGPU. If it isn't installed and Homebrew is, the plugin
   runs `brew install deno` itself the first time a session starts. At runtime that's all: no npm packages, no other
   services. (Regenerating the bundled font atlas or colour-map tables uses Python and npm tooling; the

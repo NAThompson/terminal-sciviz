@@ -272,6 +272,19 @@ async function stopRenderer($: any, kind: Kind) {
 }
 
 const failed: Record<string, number> = {} // snapshot path -> rev the renderer could not save
+// ---- terminals that can't show pictures (Terminal.app, iTerm2: it takes byte images only, and only
+// fullscreen; plain xterm; tmux without passthrough):
+// every Image draws its alt there, so the alt says why and what works; tool results carry a
+// `warning`, so the model explains in words rather than pointing at a picture nobody sees ----
+const NO_IMAGES = 'sciviz: this terminal can\'t show its images: it needs Ghostty or kitty (Terminal.app and iTerm2 aren\'t supported)'
+const TMUX_FIX = 'sciviz: tmux is holding back the images: set -g allow-passthrough on and set -g focus-events on'
+const images = { blocked: '', termProgram: '' } // blocked: why a blit was refused (set once seen)
+function imageWarning(): string {
+  if (images.blocked) return images.blocked
+  return images.termProgram === 'Apple_Terminal' || images.termProgram === 'iTerm.app' ? NO_IMAGES : ''
+}
+const withWarning = (o: Record<string, unknown>) => (imageWarning() ? { ...o, warning: `${imageWarning()}; the user sees no picture: describe it in words` } : o)
+
 function onSnapshot(kind: Kind, rev: number, path: string, isFailure = false) {
   if (isFailure) failed[path] = Math.max(failed[path] ?? 0, rev)
   else saved[path] = Math.max(saved[path] ?? 0, rev)
@@ -285,7 +298,9 @@ async function onFrame($: any, kind: Kind, gen: number, w: number, h: number, sh
     const source = shm
       ? { shm, format: 'rgba', width: w, height: h } // shared memory: no disk, read once by the terminal
       : { file: `${dir(kind)}/frame.rgba`, format: 'rgba', width: w, height: h, generation: gen }
-    await $.ui.blit({ requestId: view.live, key: 'view', columns: view.cols, rows: view.rows, source }).catch(() => {})
+    const r = await $.ui.blit({ requestId: view.live, key: 'view', columns: view.cols, rows: view.rows, source }).catch(() => null)
+    if (r?.fix === 'tmux-passthrough') images.blocked = TMUX_FIX
+    else if (r?.deny && /alt/i.test(r.deny)) images.blocked = NO_IMAGES // the Image draws its alt: no pictures here
   }
 }
 
@@ -332,10 +347,13 @@ async function drawView($: any, e: any, id: string, kind: Kind) {
   viewInfo[id] ??= { interaction: legacyInteraction(kind), home: { ...KINDS[kind].ctl } }
   if (view.intended && id === view.intended) { view.intended = ''; await makeLive($, id); void settle($, id) } // the row just opened
   const { cols, rows } = inlineSize(e.viewport)
+  // a terminal known not to show pictures: one line, not a box of empty cells (the renderer still
+  // runs, so the model's snapshots and read-outs work)
+  if (imageWarning() && !setupError && !lastError[kind]) return <Text dimColor>{imageWarning()}</Text>
   if (id !== view.live) {
     const png = viewPng(id)
     return (await $.fs.exists(png))
-      ? <Image source={{ file: png, format: 'png' }} columns={cols} rows={rows} alt="sciviz view (frozen)" />
+      ? <Image source={{ file: png, format: 'png' }} columns={cols} rows={rows} alt={imageWarning() || NO_IMAGES} />
       : <Text dimColor>sciviz view (no frame saved)</Text>
   }
   Object.assign(view, { cols, rows })
@@ -358,10 +376,10 @@ async function drawView($: any, e: any, id: string, kind: Kind) {
   const inRect = view.input && view.input.cols === cols && view.input.rows === rows ? view.input.rect : [0, 0, cols, rows]
   // a line of the controls the user has likely forgotten; none: no line, no space
   void $.store.get('hints').catch(() => null) // subscribes this draw: a practised() write redraws it
-  const hints = hintLine(kind, await hintMemory($))
+  const hints = imageWarning() ? '' : hintLine(kind, await hintMemory($)) // none over an alt message
   return (
     <Box width={cols} height={rows}>
-      <Image key="view" source={source} columns={cols} rows={rows} alt={setupError || lastError[kind] ? `sciviz: ${setupError || lastError[kind]}` : 'sciviz: starting the GPU renderer…'} />
+      <Image key="view" source={source} columns={cols} rows={rows} alt={setupError || lastError[kind] ? `sciviz: ${setupError || lastError[kind]}` : imageWarning() || NO_IMAGES} />
       <Box position="absolute" top={inRect[1]} left={inRect[0]}>
         <Client key="input" module="./input.tsx" width={inRect[2]} height={inRect[3]} />
       </Box>
@@ -700,7 +718,7 @@ async function showViewNow($: any, e: any, kind: Kind, keys: string[], replace?:
   // data arrays (series samples, control points) would flood the model's context: summarise them
   const brief = JSON.parse(JSON.stringify(shown, (_k, v) => (Array.isArray(v) && v.length > 16 ? `[${v.length} values]` : v)))
   const briefState = state && JSON.parse(JSON.stringify(state, (_k, v) => (Array.isArray(v) && v.length > 16 ? `[${v.length} values]` : v)))
-  return { result: JSON.stringify({ snapshot: done ? png : null, ...(problem ? { error: problem } : {}), entry: entry?.id, control: brief, state: briefState }) }
+  return { result: JSON.stringify(withWarning({ snapshot: done ? png : null, ...(problem ? { error: problem } : {}), entry: entry?.id, control: brief, state: briefState })) }
 }
 
 /** /sciviz <surface>: the output row about to be drawn becomes the live view. */
@@ -841,6 +859,7 @@ async function resolvePaths($: any, options: Record<string, unknown>) {
   void $.process.run(['/bin/sh', '-c', 'mkdir -p "$1" && touch "$2" && for d in "$3"/*/; do a="$d.active"; [ -e "$a" ] || a="$d"; [ -n "$(find "$a" -prune -mtime +30)" ] && rm -rf "$d"; done; true',
     'sh', `${sessions}/${session || proc}`, ACTIVE, sessions]).catch(() => {})
   GALLERY = `${ROOT}/docs`
+  try { images.termProgram = ((await $.process.run(['/usr/bin/printenv', 'TERM_PROGRAM']))?.stdout ?? '').trim() } catch { /* unknown */ }
   try { Object.assign(view, JSON.parse(await $.fs.read(SIZE_FILE()))) } catch { /* first run: defaults until a view draws */ }
 }
 
@@ -867,9 +886,10 @@ export const register: Register = (on, options) => {
       const { base64 } = await $.fs.read(png, { as: 'bytes' })
       const hd = new DataView(decodeBase64(base64.slice(0, 32)).buffer)
       const rows = Math.min(255, Math.round((cols * hd.getUint32(20)) / hd.getUint32(16) / CELL_ASPECT))
+      if (imageWarning()) return <Text dimColor>{imageWarning()}  ·  {String((e.props as any).text ?? '')}</Text>
       return (
         <Box flexDirection="column">
-          <Image source={{ file: png, format: 'png' }} columns={cols} rows={rows} alt={`sciviz gallery: ${section}`} />
+          <Image source={{ file: png, format: 'png' }} columns={cols} rows={rows} alt={imageWarning() || NO_IMAGES} />
           <Text dimColor>{String((e.props as any).text ?? '')}  ·  /sciviz {'<id>'}</Text>
         </Box>
       )
@@ -1231,7 +1251,7 @@ export const register: Register = (on, options) => {
       caption: input.caption ?? path.split('/').pop() ?? 'image',
       generation: Date.now(),
     }
-    return { result: JSON.stringify(shown) }
+    return { result: JSON.stringify(withWarning({ ...shown })) }
   })
 
   // A view's call row (`sciviz - chart (MCP)(title: ..., series: [...])`) is code in the middle of
@@ -1265,6 +1285,7 @@ export const register: Register = (on, options) => {
     }
     if (!s?.path) return next(e)
     const { Box, Image, Text } = $.ui.resolve(e)
+    if (imageWarning()) return <Text dimColor>{imageWarning()}  ·  {s.caption}</Text>
     const size = cellSize(s, e.viewport)
     return (
       <Box flexDirection="column">
@@ -1272,7 +1293,7 @@ export const register: Register = (on, options) => {
           source={{ file: s.path, format: 'png', generation: s.generation }}
           columns={size.columns}
           rows={size.rows}
-          alt={s.caption}
+          alt={`${imageWarning() || NO_IMAGES} (${s.caption})`}
         />
         <Text dimColor>{s.caption}</Text>
       </Box>
