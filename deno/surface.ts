@@ -20,7 +20,7 @@ import { cameraBasis, fitAngles, fitView, screenRect, type Vec3 } from "./lib/fr
 import { lookAtView, mul4, perspectiveProjection } from "./lib/mat4.ts";
 import { getLinearColorLut, colormapName, colormapRgb } from "./lib/colormaps.ts";
 import { colorBarTicks, createScale, getShaderScale, snapRootN, type VisScale } from "./lib/scales.ts";
-import { BitmapFont, OverlayRenderer, premul, Quads, type Rgba, rootSlider, type RootSlider, rootSliderHeight } from "./lib/overlay.ts";
+import { BitmapFont, OverlayRenderer, premul, Quads, type Rgba, ROOT_HOT, rootSlider, type RootSlider, rootSliderHeight } from "./lib/overlay.ts";
 import {
   evaluateNurbsSurface,
   evaluateSurfaceAnalysis,
@@ -530,7 +530,7 @@ export class SurfaceRenderer implements ServeRenderer<Control> {
       q.text(t.label, X + 0.5, top + bh + Math.round(6 * s), label, premul(INK2), "mt");
     }
     const sliderTop = top + bh + Math.round(6 * s) + lh + Math.round(12 * s);
-    this.slider = rootSlider(q, label, x, sliderTop, bw, (vis as ["root", number])[1], s);
+    this.slider = rootSlider(q, label, x, sliderTop, bw, (vis as ["root", number])[1], s, ctl.sliderHot === ROOT_HOT);
     return q;
   }
 

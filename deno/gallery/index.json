@@ -5157,6 +5157,73 @@
     "interaction": "pan-zoom-x"
   },
   {
+    "id": "lines/expr_sliders",
+    "section": "lines",
+    "title": "Damped cosine exp(−𝑡/τ) cos ω𝑡",
+    "description": "sliders for fn parameters: τ in a named generator and two exprs, ω in the generator",
+    "renderer": "line.ts",
+    "control": {
+      "title": "Damped cosine exp(−𝑡/τ) cos ω𝑡",
+      "xlabel": "𝑡",
+      "series": [
+        {
+          "fn": {
+            "name": "dampedCos",
+            "tau": 6,
+            "omega": 1.2,
+            "domain": [
+              0,
+              30
+            ]
+          },
+          "label": "exp(−𝑡/τ) cos ω𝑡",
+          "color": "#3987e5",
+          "width": 2
+        },
+        {
+          "fn": {
+            "expr": "exp(-x/tau)",
+            "params": {
+              "tau": 6
+            },
+            "domain": [
+              0,
+              30
+            ]
+          },
+          "label": "±exp(−𝑡/τ)",
+          "color": "#8b949e",
+          "dash": true
+        },
+        {
+          "fn": {
+            "expr": "-exp(-x/tau)",
+            "params": {
+              "tau": 6
+            },
+            "domain": [
+              0,
+              30
+            ]
+          },
+          "color": "#8b949e",
+          "dash": true
+        }
+      ],
+      "sliders": {
+        "tau": [
+          0.5,
+          20
+        ],
+        "omega": [
+          0,
+          3
+        ]
+      }
+    },
+    "interaction": "pan-zoom-x"
+  },
+  {
     "id": "lines/ecdf_band",
     "section": "lines",
     "title": "ECDF · log-normal, 𝑛 = 300",
@@ -19830,6 +19897,40 @@
       "elevation": 20,
       "scale": "root",
       "rootN": 0.5
+    },
+    "interaction": "orbit"
+  },
+  {
+    "id": "curves/lorenz_rho",
+    "section": "curves",
+    "title": "lorenz_rho",
+    "description": "Lorenz attractor with a slider for 𝜌: from a stable fixed point (𝜌 < 24.7) to chaos",
+    "renderer": "curve.ts",
+    "control": {
+      "title": "Lorenz attractor (𝜎 = 10, 𝛽 = 8/3)",
+      "ode": {
+        "system": "lorenz",
+        "n": 40000,
+        "dt": 0.004,
+        "colorBy": "time",
+        "rho": 15
+      },
+      "paramLabel": "𝑡",
+      "axisLabels": [
+        "𝑥",
+        "𝑦",
+        "𝑧"
+      ],
+      "colormap": "Plasma",
+      "lineWidth": 1.5,
+      "azimuth": 35,
+      "elevation": 20,
+      "sliders": {
+        "rho": [
+          0,
+          50
+        ]
+      }
     },
     "interaction": "orbit"
   },

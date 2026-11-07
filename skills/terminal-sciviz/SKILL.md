@@ -65,6 +65,13 @@ Compute as close to the renderer as you can, in this order:
    when tier 1 or 2 can draw it: that path can't re-sample when the user zooms, and the arrays
    flood the control.
 
+**Sliders for parameters.** To let the user explore a parameter, add `sliders: {name: [min, max]}`
+(or `{min, max, step?, label?}`) to `chart` (it sets the fn param of that name, an expr's `params`
+or a named fn's `order`/`lambda`/`tau`/`omega`/`zeta`, in every series and mark) or to a
+`gallery_open` control (curve ODEs: `curves/lorenz` with `{sliders: {rho: [0, 50]}}`, also `sigma`,
+`beta`). They're drawn in the frame; dragging re-renders live. `state.sliders` reports the values the
+user set (call `chart` again without `marks` to read them); unknown names come back as an error.
+
 **Charts are combinations of marks, channels and transforms**, not special options. Strings in
 `x`/`y` become categories; a string `fill` colours by category (palette legend, at most 8; it also
 groups rows like `z`), a numeric `fill` through a colormap (`color: {scheme, domain}`, colour bar);

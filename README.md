@@ -64,6 +64,7 @@ Then ask Claude to show you something (“plot the Lorenz attractor”, “show 
 | drag | pan | orbit |
 | shift-drag, `+` / `-` | zoom about the pointer | zoom |
 | hover | values next to the cursor | values at the surface / ray hit |
+| drag a slider (when shown) | set its parameter | same |
 | click, then `c` / `C`, `i`, `r` | cycle / invert colour map, reset | same |
 | `p`, `,` `.` (4D stacks) | play / pause, step slices | |
 

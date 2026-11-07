@@ -169,6 +169,19 @@ const exprNormal = line("expr_normal_approx", "Poisson(λ) and its normal approx
   ],
 });
 
+// the same damped cosine as a named generator, its envelope ±exp(−x/τ) as expressions: sliders for τ
+// and ω set the parameter of that name in every fn (the mod writes `sliderValues` as they're dragged)
+const envelope = { tau: 6 };
+const exprSliders = line("expr_sliders", "Damped cosine exp(−𝑡/τ) cos ω𝑡", "sliders for fn parameters: τ in a named generator and two exprs, ω in the generator", {
+  xlabel: "𝑡",
+  series: [
+    { fn: { name: "dampedCos", tau: 6, omega: 1.2, domain: [0, 30] }, label: "exp(−𝑡/τ) cos ω𝑡", color: BLUE, width: 2 },
+    { fn: { expr: "exp(-x/tau)", params: envelope, domain: [0, 30] }, label: "±exp(−𝑡/τ)", color: INK2, dash: true },
+    { fn: { expr: "-exp(-x/tau)", params: envelope, domain: [0, 30] }, color: INK2, dash: true },
+  ],
+  sliders: { tau: [0.5, 20], omega: [0, 3] },
+});
+
 // --- distributions: stats of raw samples (line.ts `stat`, lib/stats.ts) ---------------------------
 
 // 300 log-normal(0, ½) draws: their ECDF with the 95% DKW band, over the true CDF Φ(ln 𝑥 / σ)
@@ -403,6 +416,7 @@ export const entries: Entry[] = [
   scoreRuns,
   poissonHist,
   exprNormal,
+  exprSliders,
   ecdfBand,
   qqNormal,
   boxGroups,

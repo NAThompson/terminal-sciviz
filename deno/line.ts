@@ -27,6 +27,7 @@ import { BitmapFont, type FontSize, FRAME_FORMAT, OverlayRenderer, premul, Quads
 import { getHermiteExtent, getPchipSlopes, getSplineSlopes, hermiteAt, hermiteNurbs, linspace } from "./lib/pchip.ts";
 import { ChordRenderer } from "./lib/chords.ts";
 import { type FnSpec, resolveFn } from "./lib/generators.ts";
+import { drawSliders, fnObject, fnParams, resolveSliders, type Slider, type SliderDef, sliderHeight } from "./lib/sliders.ts";
 import { main, type Pending, type Renderer as ServeRenderer } from "./lib/serve.ts";
 import { boxStats, closestSpacing, ecdf, histogram, linreg, qq, sortedFinite } from "./lib/stats.ts";
 import { type ColorBar, type Columns, type Compiled, compileMarks, type Mark, type Prims, type Scales } from "./lib/marks.ts";
@@ -119,12 +120,32 @@ export const DEFAULTS = {
   x1: null as number | null,
   ymin: null as number | null, // null: fit what is visible, 8% margin (in axis space)
   ymax: null as number | null,
+  sliders: null as Record<string, unknown> | null, // {name: [min, max] | {min, max, step?, label?}}: of fn params (lib/sliders.ts)
+  sliderValues: null as Record<string, number> | null, // set by dragging them
   hover: null as [number, number] | null,
   snapshot: null as { path: string; rev: number } | string | null,
   frameFile: false,
   quit: false,
 };
 export type Control = typeof DEFAULTS & Record<string, unknown>;
+
+/** The control with its sliders' values in the fn params they name (series and marks copied). */
+function withSliders(ctl: Control): { ctl: Control; defs: SliderDef[] } {
+  if (!ctl.sliders) return { ctl, defs: [] };
+  const series = structuredClone(ctl.series), marks = structuredClone(Array.isArray(ctl.marks) ? ctl.marks : []);
+  for (const sp of series) { // generator names alone: as {name}, their args settable
+    if (sp.fn) sp.fn = fnObject(sp.fn) as FnSpec;
+    if (sp.sample) sp.sample.fn = fnObject(sp.sample.fn) as FnSpec;
+    if (sp.fill) sp.fill = { ...sp.fill, lo: fnObject(sp.fill.lo) as FillBound, hi: fnObject(sp.fill.hi) as FillBound };
+  }
+  for (const m of marks) if (m?.fn) m.fn = fnObject(m.fn) as FnSpec;
+  const params = [
+    ...series.flatMap((sp) => [sp.fn, sp.sample?.fn, sp.fill?.lo, sp.fill?.hi].flatMap(fnParams)),
+    ...marks.flatMap((m) => fnParams(m?.fn)),
+  ];
+  const defs = resolveSliders(ctl.sliders, ctl.sliderValues, params);
+  return { ctl: { ...ctl, series, marks }, defs };
+}
 
 // --- Series ------------------------------------------------------------------------------------
 
@@ -721,6 +742,8 @@ export class LinePlot implements ServeRenderer<Control> {
   private marked?: ReturnType<typeof compileMarks>; // the last good compile
   private marksError?: unknown; // of the compile of marksKey, if it failed
   private colorbar?: ColorBar;
+  private sliderDefs: SliderDef[] = [];
+  private sliders: Slider[] = []; // as drawn
 
   constructor(private readonly device: GPUDevice, private readonly font: BitmapFont) {
     this.overlay = new OverlayRenderer(device, font);
@@ -865,8 +888,8 @@ export class LinePlot implements ServeRenderer<Control> {
       throw new Error("x1 must be above x0");
     }
     // Geometry: the view and the curve layer; chrome: grid, text, references, legend
-    const geomKey = JSON.stringify([this.dataGen, w, h, x0, x1, ctl.ymin, ctl.ymax, ctl.overlays, Boolean(ctl.ylabel), Boolean(ctl.xlabel)]);
-    const chromeKey = JSON.stringify([geomKey, ctl.legend, ctl.title, ctl.subtitle, ctl.xlabel, ctl.ylabel, ctl.zeroLine, ctl.nanColor]);
+    const geomKey = JSON.stringify([this.dataGen, w, h, x0, x1, ctl.ymin, ctl.ymax, ctl.overlays, Boolean(ctl.ylabel), Boolean(ctl.xlabel), this.sliderDefs.length]);
+    const chromeKey = JSON.stringify([geomKey, ctl.legend, ctl.title, ctl.subtitle, ctl.xlabel, ctl.ylabel, ctl.zeroLine, ctl.nanColor, this.sliderDefs, ctl.sliderHot]);
     if (geomKey !== this.geomKey) {
       this.setGeometry(ctl, w, h, x0, x1, tx, ty);
       this.geomKey = geomKey;
@@ -881,7 +904,7 @@ export class LinePlot implements ServeRenderer<Control> {
   private setGeometry(ctl: Control, w: number, h: number, x0: number, x1: number, tx: ReturnType<typeof axisTransform>, ty: ReturnType<typeof axisTransform>): void {
     const s = Math.min(Math.max(Math.min(w / 1200, h / 750), 0.6), 2.5);
     const F = this.fonts(s);
-    const T = Math.round((ctl.ylabel ? 74 : 56) * s);
+    const T = Math.round((ctl.ylabel ? 74 : 56) * s) + (this.sliderDefs.length ? sliderHeight(F.label, s) + Math.round(14 * s) : 0); // sliders: a row under the title
     const B = h - Math.round((ctl.xlabel ? 62 : 40) * s);
     const R = w - Math.round(24 * s);
 
@@ -1083,6 +1106,8 @@ export class LinePlot implements ServeRenderer<Control> {
     const tw = ctl.title ? q.text(ctl.title, L, ty0, F.title, premul(INK), "lm") : 0;
     if (ctl.subtitle) q.text(ctl.subtitle, L + tw + Math.round(16 * s), ty0, F.sub, premul(INK2), "lm");
     if (ctl.ylabel) q.text(ctl.ylabel, L, T - Math.round(12 * s), F.sub, premul(INK2), "lb");
+    const n = this.sliderDefs.length, gap = Math.round(32 * s);
+    this.sliders = drawSliders(q, F.label, this.sliderDefs, L, Math.round(48 * s), Math.min(Math.round(160 * s), (R - L - gap * (n - 1)) / n), gap, s, false, ctl.sliderHot);
     if (ctl.xlabel) q.text(ctl.xlabel, (L + R) / 2, B + Math.round(30 * s), F.sub, premul(INK2), "mt");
 
     // References: bands under the curves, lines over them
@@ -1570,6 +1595,9 @@ export class LinePlot implements ServeRenderer<Control> {
 
   async submit(ctl: Control, slot: number): Promise<Pending> {
     const { device } = this;
+    let defs: SliderDef[];
+    ({ ctl, defs } = withSliders(ctl));
+    this.sliderDefs = defs;
     ctl = this.withMarks(ctl);
     this.setData(ctl, Array.isArray(ctl.marks) && ctl.marks.length ? this.marksKey : "");
     this.ensureDense(ctl);
@@ -1627,6 +1655,7 @@ export class LinePlot implements ServeRenderer<Control> {
       ymax: ty.inv(v.y1),
       domain: [tx.inv(this.extent[0]), tx.inv(this.extent[1])],
       plotRect: [...v.plot],
+      ...(this.sliders.length ? { sliders: this.sliders } : {}),
       series: this.series.map((sr) => sr.label),
       ...(this.series.some((sr) => sr.stats) ? { stats: this.series.filter((sr) => sr.stats).map((sr) => ({ label: sr.label, ...sr.stats })) } : {}),
       hover,

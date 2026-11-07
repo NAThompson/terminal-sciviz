@@ -33,9 +33,10 @@ import { makeReadBuffer, requestGpuDevice, rowBytes, TextureTarget } from "./lib
 import { NurbsGpuRenderer } from "./lib/gpu_line.ts";
 import { DRAW_WGSL as CURVE3D_WGSL, NurbsCurve3DGpuRenderer } from "./lib/gpu_curve3d.ts";
 import { DEPTH_FORMAT, getTargets, type RenderTargets, SAMPLE_COUNT } from "./lib/gpu_surface.ts";
-import { BitmapFont, type FontSize, FRAME_FORMAT, OverlayRenderer, premul, Quads, type Rgba, rootSlider, type RootSlider, rootSliderHeight } from "./lib/overlay.ts";
+import { BitmapFont, type FontSize, FRAME_FORMAT, OverlayRenderer, premul, Quads, type Rgba, ROOT_HOT, rootSlider, type RootSlider, rootSliderHeight } from "./lib/overlay.ts";
 import { main, type Pending, type Renderer as ServeRenderer } from "./lib/serve.ts";
 import { CURVES, curvePoints } from "./lib/generators.ts";
+import { drawSliders, type Param, resolveSliders, type Slider, type SliderDef, sliderHeight } from "./lib/sliders.ts";
 
 const BLUE = "#3987e5", ORANGE = "#d95926", MAGENTA = "#d55181";
 const INK = "#c9d1d9", INK2 = "#8b949e", GRID = "#262c36", ZERO = "#484f58", SURFACE = "#101216", HOVER_RING = "#e6edf3";
@@ -84,12 +85,33 @@ export const DEFAULTS = {
   x1: null as number | null,
   ymin: null as number | null,
   ymax: null as number | null,
+  sliders: null as Record<string, unknown> | null, // {name: [min, max] | {min, max, step?, label?}}: of ode / gen parameters
+  sliderValues: null as Record<string, number> | null, // set by dragging them
+  interacting: false, // while the mod drags a slider (or orbits): the 3D framing held
   hover: null as [number, number] | null,
   snapshot: null as { path: string; rev: number } | string | null,
   frameFile: false,
   quit: false,
 };
 export type Control = typeof DEFAULTS & Record<string, unknown>;
+
+const ODE_PARAMS = { sigma: 10, rho: 28, beta: 8 / 3 };
+
+/** The control with its sliders' values in the ode / gen parameters they name (those copied). */
+function withSliders(ctl: Control): { ctl: Control; defs: SliderDef[] } {
+  if (!ctl.sliders) return { ctl, defs: [] };
+  const ode = ctl.ode ? { ...(ctl.ode as Record<string, unknown>) } : undefined;
+  const gen = ctl.gen ? { ...(ctl.gen as Record<string, unknown>) } : undefined;
+  const c = gen && CURVES[gen.name as string];
+  const at = (obj: Record<string, unknown>, names: string[], defaults: number[]): Param[] =>
+    names.map((k, i) => ({ name: k, obj, key: k, value: obj[k] === undefined ? defaults[i] : Number(obj[k]) }));
+  const params = [
+    ...(ode ? at(ode, Object.keys(ODE_PARAMS), Object.values(ODE_PARAMS)) : []),
+    ...(gen && c ? at(gen, c.args, c.defaults) : []),
+  ];
+  const defs = resolveSliders(ctl.sliders, ctl.sliderValues, params);
+  return { ctl: { ...ctl, ...(ode && { ode }), ...(gen && { gen }) }, defs };
+}
 
 /** An ODE trajectory, integrated here (classic fourth-order Runge-Kutta, the first
  * `transient` steps dropped) so controls stay small: `{system: "lorenz", n, dt, sigma, rho, beta, transient,
@@ -106,7 +128,7 @@ export function expandOde(ctl: Control): Control {
   const key = JSON.stringify(ode);
   let out = odeCache.get(key);
   if (!out) {
-    const { n = 40_000, dt = 0.004, sigma = 10, rho = 28, beta = 8 / 3, transient = 1000, colorBy = "time" } = ode;
+    const { n = 40_000, dt = 0.004, sigma = ODE_PARAMS.sigma, rho = ODE_PARAMS.rho, beta = ODE_PARAMS.beta, transient = 1000, colorBy = "time" } = ode;
     if (!(n >= 2 && n <= 1_000_000) || !(dt > 0)) throw new Error("ode: need 2 <= n <= 1e6 and dt > 0");
     const f = (x: number, y: number, z: number) => [sigma * (y - x), x * (rho - z) - y, x * y - beta * z];
     let [x, y, z] = [1, 1, 1];
@@ -206,12 +228,14 @@ function sampleCurve(curve: NurbsCurve, spans: KnotSpan[], total = 4000): { u: n
   const len = spans.reduce((a, s) => a + (s.end - s.start), 0);
   const u: number[] = [];
   const p: number[][] = [];
+  const { dims, points } = curve;
+  const polyline = curve.degree === 1 && curve.weights.every((w) => w === 1); // at a knot: the vertex itself
   for (const s of spans) {
     const steps = Math.max(curve.degree === 1 ? 1 : 4, Math.ceil((total * (s.end - s.start)) / len));
     for (let k = 0; k < steps; k += 1) {
       const t = s.start + ((s.end - s.start) * k) / steps;
       u.push(t);
-      p.push(evaluateNurbs(curve, t, s.index));
+      p.push(polyline && k === 0 ? Array.from(points.slice((s.index - 1) * dims, s.index * dims)) : evaluateNurbs(curve, t, s.index));
     }
   }
   const last = spans[spans.length - 1];
@@ -372,6 +396,9 @@ export class CurvePlot implements ServeRenderer<Control> {
   private barDomain: [number, number] = [0, 1];
   private rootN: number | null = null; // root colour scale's n (3D colour by values)
   private slider: RootSlider | null = null; // as drawn
+  private sliderDefs: SliderDef[] = [];
+  private sliders: Slider[] = []; // as drawn
+  private heldFit?: [Vec3, number]; // the 3D framing while `interacting`
   private values?: (u: number) => number;
   private fitPoints = new Float64Array(0);
   viewProjection: number[] = [];
@@ -538,7 +565,8 @@ export class CurvePlot implements ServeRenderer<Control> {
   // 2D ---------------------------------------------------------------------------------------------
 
   private frame2D(ctl: Control, w: number, h: number, s: number): void {
-    const [L, T, R, B] = [Math.round(66 * s), Math.round(56 * s), w - Math.round(24 * s), h - Math.round(40 * s)];
+    const rowH = this.sliderDefs.length ? sliderHeight(this.fonts(s).label, s) + Math.round(14 * s) : 0; // sliders: a row under the title
+    const [L, T, R, B] = [Math.round(66 * s), Math.round(56 * s) + rowH, w - Math.round(24 * s), h - Math.round(40 * s)];
     let [x0, x1, y0, y1] = [Infinity, -Infinity, Infinity, -Infinity];
     const take = (x: number, y: number) => {
       x0 = Math.min(x0, x); x1 = Math.max(x1, x); y0 = Math.min(y0, y); y1 = Math.max(y1, y);
@@ -586,17 +614,20 @@ export class CurvePlot implements ServeRenderer<Control> {
       q.text(t.label, L - Math.round(10 * s), Y + 0.5, F.tick, premul(INK2), "rm");
     }
     this.titleRow(q, ctl, L, s);
+    this.sliders = drawSliders(q, F.label, this.sliderDefs, L, Math.round(48 * s), Math.round(160 * s), Math.round(32 * s), s, false, ctl.sliderHot);
     this.chrome = q;
   }
 
   // 3D ---------------------------------------------------------------------------------------------
 
   private frame3D(ctl: Control, w: number, h: number, s: number): void {
-    const bar = ctl.colorBy ? Math.round(110 * s) : 0;
+    const bar = ctl.colorBy || this.sliderDefs.length ? Math.round(110 * s) : 0; // the right column: colour bar, sliders
     const [L, T, R, B] = [Math.round(16 * s), Math.round(56 * s), w - Math.round(16 * s) - bar, h - Math.round(16 * s)];
     this.plot3 = [L, T, R, B];
     const [pw, ph] = [R - L, B - T];
-    const fit = fitView(this.fitPoints, ...fitAngles(ctl), FOV, pw / ph) ?? [[0, 0, 0], 3];
+    // dragging a slider: the framing held (the curve grows and shrinks in it), refitted on release
+    const fit = (ctl.interacting && this.heldFit) || (fitView(this.fitPoints, ...fitAngles(ctl), FOV, pw / ph) ?? [[0, 0, 0], 3]);
+    this.heldFit = fit;
     this.target = fit[0];
     this.distance = fit[1] / (Number(ctl.zoom) || 1);
     const [f] = cameraBasis(ctl.azimuth, ctl.elevation);
@@ -628,11 +659,15 @@ export class CurvePlot implements ServeRenderer<Control> {
 
     const q = new Quads(this.font);
     this.titleRow(q, ctl, L + Math.round(50 * s), s);
+    // Parameter sliders: stacked at the top of the right column, the colour bar below them
+    const gap = Math.round(12 * s);
+    this.sliders = drawSliders(q, this.fonts(s).label, this.sliderDefs, R + Math.round(20 * s), T, Math.round(84 * s), gap, s, true, ctl.sliderHot);
+    const barTop = T + Math.round(20 * s) + this.sliders.length * (sliderHeight(this.fonts(s).label, s) + gap) + (this.sliders.length ? Math.round(14 * s) : 0);
     // Root scale: its slider under the colour bar (raised to make room)
     const sliderTop = B - Math.round(4 * s) - rootSliderHeight(this.fonts(s).label, s);
     const barBottom = this.rootN === null ? B - Math.round(30 * s) : sliderTop - Math.round(16 * s);
-    if (ctl.colorBy) this.colorBar(q, ctl, R + Math.round(30 * s), T + Math.round(20 * s), barBottom, s);
-    this.slider = this.rootN === null ? null : rootSlider(q, this.fonts(s).label, R + Math.round(20 * s), sliderTop, Math.round(84 * s), this.rootN, s);
+    if (ctl.colorBy) this.colorBar(q, ctl, R + Math.round(30 * s), barTop, barBottom, s);
+    this.slider = this.rootN === null ? null : rootSlider(q, this.fonts(s).label, R + Math.round(20 * s), sliderTop, Math.round(84 * s), this.rootN, s, ctl.sliderHot === ROOT_HOT);
     this.chrome = q;
   }
 
@@ -743,6 +778,9 @@ export class CurvePlot implements ServeRenderer<Control> {
   // Frame ------------------------------------------------------------------------------------------
 
   async submit(ctl: Control, slot: number): Promise<Pending> {
+    let defs: SliderDef[];
+    ({ ctl, defs } = withSliders(ctl));
+    this.sliderDefs = defs;
     ctl = expandOde(expandGen(ctl));
     const { device } = this;
     this.setData(ctl);
@@ -752,7 +790,7 @@ export class CurvePlot implements ServeRenderer<Control> {
     this.scale = s;
     this.size = [w, h];
     const key = JSON.stringify([this.dataKey, w, h, ctl.azimuth, ctl.elevation, ctl.zoom, ctl.x0, ctl.x1, ctl.ymin, ctl.ymax,
-      ctl.title, ctl.subtitle, ctl.color, ctl.lineWidth, ctl.lineCap, ctl.colorLabel]);
+      ctl.title, ctl.subtitle, ctl.color, ctl.lineWidth, ctl.lineCap, ctl.colorLabel, defs, ctl.interacting, ctl.sliderHot]);
     if (key !== this.frameKey) {
       if (this.is3D) this.frame3D(ctl, w, h, s);
       else this.frame2D(ctl, w, h, s);
@@ -803,7 +841,8 @@ export class CurvePlot implements ServeRenderer<Control> {
   }
 
   state(ctl: Control, generation: number, hover: unknown, ms: number): unknown {
-    const base = { generation, width: this.size[0], height: this.size[1], dims: this.curve.dims, hover, renderMs: Math.round(ms * 1000) / 1000 };
+    const base = { generation, width: this.size[0], height: this.size[1], dims: this.curve.dims, hover, renderMs: Math.round(ms * 1000) / 1000,
+      ...(this.sliders.length ? { sliders: this.sliders } : {}) };
     if (this.is3D) {
       const root = this.slider ? { rootN: this.slider.value, rootSlider: this.slider } : {};
       return { ...base, azimuth: ctl.azimuth, elevation: ctl.elevation, distance: this.distance, target: this.target, plotRect: this.plot3, content: this.content, colorDomain: this.barDomain, ...root };

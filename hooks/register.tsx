@@ -58,7 +58,7 @@ const VIEW_TOOL = 'mcp__sciviz__view'
 const PLOT_TOOL = 'mcp__sciviz__plot'
 const OPEN_TOOL = 'mcp__sciviz__gallery_open'
 const CHART_TOOL = 'mcp__sciviz__chart'
-const CHART_KEYS = ['title', 'subtitle', 'xlabel', 'ylabel', 'x', 'y', 'series', 'marks', 'color', 'r', 'overlays', 'legend', 'x0', 'x1', 'ymin', 'ymax']
+const CHART_KEYS = ['title', 'subtitle', 'xlabel', 'ylabel', 'x', 'y', 'series', 'marks', 'color', 'r', 'overlays', 'legend', 'x0', 'x1', 'ymin', 'ymax', 'sliders']
 // Resolved at session start (resolvePaths): ROOT holds deno/ (the plugin's own folder once installed,
 // or the projectDir option); RUN is per-user state (control files, frames, snapshots).
 let ROOT = ''
@@ -139,7 +139,7 @@ let manifest: Entry[] | null = null
 /** The gallery's entries (gallery.ts manifest), cached; `fresh` re-reads it (new entries since load). */
 async function entries($: any, fresh = false): Promise<Entry[]> {
   if (manifest && !fresh) return manifest
-  try { manifest = JSON.parse(await $.fs.read(`${ROOT}/deno/gallery/index.json`)) as Entry[] } catch { manifest = [] }
+  try { manifest = JSON.parse(await $.fs.read(`${ROOT}/deno/gallery/index.json`)) as Entry[] } catch { return [] } // not cached: retry
   return manifest
 }
 
@@ -538,16 +538,23 @@ async function resolveCamera($: any, kind: Kind) {
   if (typeof ctl.zoom !== 'number') ctl.zoom = 1
 }
 
+/** `v` on a slider's grid (min + k step), rounded to the step's precision, then within its range. */
+const snapTo = (v: number, { min, max, step }: { min: number; max: number; step: number }) => {
+  const digits = Math.min(100, Math.max(0, Math.ceil(-Math.log10(step)) + 2))
+  return Math.min(max, Math.max(min, Number((min + Math.round((v - min) / step) * step).toFixed(digits))))
+}
 /** The root degree on its slider's grid: 0.1 to 10 in steps of 0.05. */
-const snapRootN = (n: number) => Math.min(10, Math.max(0.1, Math.round(n / 0.05) * 0.05))
+const snapRootN = (n: number) => snapTo(n, { min: 0.1, max: 10, step: 0.05 })
 
-/** The renderer's in-frame slider (state.json rootSlider: track rect in frame px, range), if any. */
-async function rootSlider($: any, kind: Kind) {
-  try {
-    const st = JSON.parse(await $.fs.read(`${dir(kind)}/state.json`))
-    const r = st.rootSlider
-    return r && Array.isArray(r.rect) ? { ...r, w: st.width, h: st.height } : null
-  } catch { return null }
+/** control.sliderHot for a slider of stateSliders: its name, or the root slider's sentinel (overlay.ts ROOT_HOT). */
+const hotName = (sl: any) => (sl.kind === 'root' ? 'ⁿ√' : sl.name)
+
+/** The renderer's in-frame sliders as drawn (state.json: `sliders` of parameters, `rootSlider` of
+ * the root colour scale, `kind: 'root'`): track rects in frame px, ranges. */
+function stateSliders(st: any): any[] {
+  const all = [...(Array.isArray(st?.sliders) ? st.sliders.map((sl: any) => ({ ...sl, kind: 'param' })) : []),
+    ...(st?.rootSlider ? [{ ...st.rootSlider, kind: 'root' }] : [])]
+  return all.filter((sl) => Array.isArray(sl?.rect)).map((sl) => ({ ...sl, w: st.width, h: st.height }))
 }
 
 /** After a settled frame of a 3D view: the cells its object covers (state.json `content`, plus the
@@ -559,7 +566,7 @@ async function refreshInputRect($: any, kind: Kind) {
   let rect: number[] | null = null
   const content = st?.content ?? st?.plotRect // 3D: the object's box; 2D: the plot area (pan, zoom, hover)
   if (Array.isArray(content) && st.width > 0 && st.height > 0) {
-    const boxes = [content, ...(Array.isArray(st.rootSlider?.rect) ? [st.rootSlider.rect] : [])]
+    const boxes = [content, ...stateSliders(st).map((sl) => sl.rect)]
     const [x0, y0, x1, y1] = boxes.reduce((a: number[], b: number[]) => [Math.min(a[0], b[0]), Math.min(a[1], b[1]), Math.max(a[2], b[2]), Math.max(a[3], b[3])])
     const cx0 = Math.max(0, Math.floor((x0 / st.width) * cols) - 1), cy0 = Math.max(0, Math.floor((y0 / st.height) * rows) - 1)
     // no slack below: what follows the view on screen can start above its laid-out bottom rows
@@ -602,23 +609,37 @@ async function onPointer($: any, kind: Kind, ev: any) {
   void writeOverlay($, JSON.stringify({ seq: ++overlaySeq, type: ev.type, x, y, cols, rows,
     fine: !!ev.fine, drag: ev.type === 'down' || (!!view.drag && ev.type !== 'up' && ev.type !== 'leave'), kind, id: view.live }))
   const sliderAt = async () => {
-    const sl = (Array.isArray(ctl.scale) ? ctl.scale[0] : ctl.scale) === 'root' ? await rootSlider($, kind) : null
-    if (!sl) return null
+    if (!ctl.sliders && (Array.isArray(ctl.scale) ? ctl.scale[0] : ctl.scale) !== 'root') return null
+    let st: any = null
+    try { st = JSON.parse(await $.fs.read(`${dir(kind)}/state.json`)) } catch { return null }
     // hit test in cells, at least a whole cell beyond the track on every side: the slider is under
-    // a cell tall on screen and terminal pointer positions are coarse
-    const [x0, y0, x1, y1] = sl.rect
-    const cx0 = (x0 / sl.w) * cols - 1, cx1 = (x1 / sl.w) * cols + 1
-    const cy0 = (y0 / sl.h) * rows - 1, cy1 = (y1 / sl.h) * rows + 1
-    if (x < cx0 || x > cx1 || y < cy0 || y > cy1) return null
-    return { sl, px: Math.min(x1, Math.max(x0, (x / cols) * sl.w)) }
+    // a cell tall on screen and terminal pointer positions are coarse; the nearest track wins
+    let best: any = null
+    for (const sl of stateSliders(st)) {
+      const [x0, y0, x1, y1] = sl.rect
+      const [tx0, tx1, ty0, ty1] = [(x0 / sl.w) * cols, (x1 / sl.w) * cols, (y0 / sl.h) * rows, (y1 / sl.h) * rows]
+      if (x < tx0 - 1 || x > tx1 + 1 || y < ty0 - 1 || y > ty1 + 1) continue
+      const d = Math.abs(y - (ty0 + ty1) / 2) + Math.max(0, tx0 - x, x - tx1) // in cells, from the track
+      if (!best || d < best.d) best = { sl, d, px: Math.min(x1, Math.max(x0, (x / cols) * sl.w)) }
+    }
+    return best
   }
   const setFromSlider = (sl: any, px: number) => {
     const [x0, , x1] = sl.rect
-    ctl.rootN = snapRootN(sl.min + ((px - x0) / Math.max(1, x1 - x0)) * (sl.max - sl.min))
+    const v = sl.min + ((px - x0) / Math.max(1, x1 - x0)) * (sl.max - sl.min)
+    ctl.sliderHot = hotName(sl)
+    if (sl.kind === 'root') ctl.rootN = snapTo(v, sl)
+    else ctl.sliderValues = { ...ctl.sliderValues, [sl.name]: snapTo(v, sl) }
   }
   if (ev.type === 'down') {
     const hit = await sliderAt()
-    if (hit) { view.drag = { x, y, ctl: { ...ctl }, win: null, zooming: false, slider: hit.sl } as any; setFromSlider(hit.sl, hit.px); await writeControl($, kind); return }
+    if (hit) {
+      view.drag = { x, y, ctl: { ...ctl }, win: null, zooming: false, slider: hit.sl } as any
+      if (hit.sl.kind !== 'root') ctl.interacting = true // curve.ts holds its framing while a parameter moves
+      setFromSlider(hit.sl, hit.px)
+      await writeControl($, kind)
+      return
+    }
   }
   if (ev.type === 'move' && (view.drag as any)?.slider) {
     const sl = (view.drag as any).slider
@@ -641,8 +662,10 @@ async function onPointer($: any, kind: Kind, ev: any) {
     // while orbiting: fewer pixels, and renderers that support it (volume.ts) cut their ray-march samples
     if (interaction === 'orbit') Object.assign(ctl, { width: Math.round(view.pxW * DRAG_SCALE), height: Math.round(view.pxH * DRAG_SCALE), interacting: true })
   } else if (ev.type === 'up' || (ev.type === 'leave' && view.drag)) {
+    const slid = !!(view.drag as any)?.slider
     view.drag = null
     if (interaction === 'orbit') Object.assign(ctl, { width: view.pxW, height: view.pxH, interacting: false })
+    if (slid) ctl.interacting = false
     await settle($)
     return
   } else if (ev.type === 'move' && view.drag) {
@@ -672,9 +695,13 @@ async function onPointer($: any, kind: Kind, ev: any) {
       }
     }
   } else if (ev.type === 'move') {
-    ctl.hover = [Math.floor((x / cols) * ctl.width), Math.floor((y / rows) * ctl.height)]
+    const hit = await sliderAt() // over a slider: its knob grows, no value readout
+    const hot = hit ? hotName(hit.sl) : null
+    const hover = hit ? null : [Math.floor((x / cols) * ctl.width), Math.floor((y / rows) * ctl.height)]
+    if (hit && hot === ctl.sliderHot && ctl.hover === null) return // nothing changed: no frame
+    Object.assign(ctl, { sliderHot: hot, hover })
   } else if (ev.type === 'leave') {
-    ctl.hover = null
+    Object.assign(ctl, { sliderHot: null, hover: null })
   }
   await writeControl($, kind)
 }
@@ -935,9 +962,10 @@ export const register: Register = (on, options) => {
   })
 
   on('tool.call', { tool: OPEN_TOOL }, async ($, e) => {
-    const all = await entries($)
+    let all = await entries($)
     const want = String((e as any).id ?? '')
-    const found = findEntries(all, want)
+    let found = findEntries(all, want)
+    if (!found.length) found = findEntries((all = await entries($, true)), want) // maybe added since the mod loaded
     if (found.length !== 1) return { deny: `"${want}" matches ${found.length ? found.map((x) => x.id).join(', ') : 'no entry'}; ids: ${all.map((x) => x.id).join(', ')}` }
     const entry = found[0]
     const overrides = ((e as any).control ?? {}) as Ctl
@@ -991,7 +1019,7 @@ export const register: Register = (on, options) => {
         type: 'object',
         properties: {
           id: ids.length ? { type: 'string', enum: ids } : { type: 'string' },
-          control: { type: 'object', description: 'overrides of the entry control' },
+          control: { type: 'object', description: 'overrides of the entry control; sliders: {name: [min, max]} adds in-frame sliders for parameters (e.g. curves/lorenz: {sliders: {rho: [0, 50]}})' },
         },
         required: ['id'],
       },
@@ -1148,6 +1176,7 @@ export const register: Register = (on, options) => {
             },
           },
           legend: { type: 'boolean', description: 'default true (in the emptiest corner)' },
+          sliders: { type: 'object', description: '{name: [min, max] | {min, max, step?, label?}}: in-frame sliders the user drags, each setting the fn param (expr params, or a named fn\'s order, lambda, tau, omega, zeta...) of that name in every series/mark; its value starts at the param\'s. state.sliders reports the values the user set' },
           x0: { type: ['number', 'null'], description: 'visible x window start, data units; null: all data' },
           x1: { type: ['number', 'null'] },
           ymin: { type: ['number', 'null'], description: 'null: fit what is visible' },

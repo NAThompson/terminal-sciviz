@@ -60,7 +60,7 @@ import {
 import { CENTROID_BASE, getCaseTriangles } from "./lib/marching_cubes.ts";
 import { cameraBasis, fitAngles, fitView, screenRect as pixelRect, type Vec3 } from "./lib/framing.ts";
 import { makeReadBuffer, rowBytes } from "./lib/gpu.ts";
-import { BitmapFont, type FontSize, FRAME_FORMAT, OverlayRenderer, premul, Quads, type Rgba, rootSlider, type RootSlider, rootSliderHeight } from "./lib/overlay.ts";
+import { BitmapFont, type FontSize, FRAME_FORMAT, OverlayRenderer, premul, Quads, type Rgba, ROOT_HOT, rootSlider, type RootSlider, rootSliderHeight } from "./lib/overlay.ts";
 import { main, type Pending, type Renderer as ServeRenderer } from "./lib/serve.ts";
 
 const INK = "#c9d1d9", INK2 = "#8b949e", HOVER_RING = "#e6edf3";
@@ -1717,7 +1717,7 @@ export class VolumePlot implements ServeRenderer<Control> {
     const sliderTop = B - Math.round(10 * s) - rootSliderHeight(F.label, s);
     const barBottom = root === null ? B - Math.round(34 * s) : sliderTop - Math.round(34 * s);
     this.colorBar(q, ctl, colors, R + Math.round(36 * s), T + Math.round(34 * s), barBottom, s);
-    this.slider = root === null ? null : rootSlider(q, F.label, R + Math.round(36 * s), sliderTop, Math.round(100 * s), root, s);
+    this.slider = root === null ? null : rootSlider(q, F.label, R + Math.round(36 * s), sliderTop, Math.round(100 * s), root, s, ctl.sliderHot === ROOT_HOT);
     this.hoverInfo = null;
     if (ctl.hover) {
       const info = this.pick(ctl, Number(ctl.hover[0]), Number(ctl.hover[1]), values, counts);

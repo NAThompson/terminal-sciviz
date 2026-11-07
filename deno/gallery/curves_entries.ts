@@ -148,6 +148,16 @@ const lorenzRoot: Entry = {
   control: { ...lorenz.control, ode: { system: "lorenz", n: 40_000, dt: 0.004, colorBy: "speed" }, scale: "root", rootN: 0.5 },
 };
 
+// The same with a slider for ρ (the mod writes `sliderValues.rho` as it's dragged, curve.ts
+// re-integrates): below ρ = 1 the origin attracts; up to ρ ≈ 24.7 one of C± does; chaos past it
+const lorenzRho: Entry = {
+  ...lorenz,
+  id: "curves/lorenz_rho",
+  title: "lorenz_rho",
+  description: "Lorenz attractor with a slider for 𝜌: from a stable fixed point (𝜌 < 24.7) to chaos",
+  control: { ...lorenz.control, title: "Lorenz attractor (𝜎 = 10, 𝛽 = 8/3)", ode: { ...lorenz.control.ode as object, rho: 15 }, sliders: { rho: [0, 50] } },
+};
+
 // three.js's webgl_lines_fat: a 3D Hilbert curve (as GeometryUtils.hilbert3D: corners of a cube
 // visited recursively, each sub-cube's corners permuted) through which a smooth curve is drawn
 // thick, with a hue gradient. Here the curve is exact: three's Catmull-Rom spline through the 64
@@ -203,4 +213,4 @@ const hilbertFat: Entry = {
   interaction: "orbit",
 };
 
-export const entries: Entry[] = [...nurbsEntries, trefoilCurvature, lorenz, lorenzRoot, hilbertFat, chirp, cornu];
+export const entries: Entry[] = [...nurbsEntries, trefoilCurvature, lorenz, lorenzRoot, lorenzRho, hilbertFat, chirp, cornu];

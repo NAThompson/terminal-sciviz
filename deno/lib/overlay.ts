@@ -309,6 +309,10 @@ export class Quads {
 
   constructor(private readonly font: BitmapFont) {}
 
+  measure(font: FontSize, text: string): number {
+    return this.font.measure(font, text);
+  }
+
   get count(): number {
     return this.used / QUAD_FLOATS;
   }
@@ -386,18 +390,29 @@ export interface RootSlider { rect: [number, number, number, number]; min: numbe
 /** Height (px) `rootSlider` draws at scale `s`. */
 export const rootSliderHeight = (font: FontSize, s: number) => Math.ceil(font.ascent + font.descent) + Math.round(14 * s);
 
-/** Slider of the root colour scale's `n` (in the theme's ink: track #8b949e, thumb #c9d1d9): its
- * label `ⁿ√  n = 3.00` from (x, top), the track `width` px long below it. */
-export function rootSlider(q: Quads, font: FontSize, x: number, top: number, width: number, n: number, s: number): RootSlider {
-  const { min, max, step } = ROOT_N;
+/** A labelled slider in the theme's ink (track #8b949e, thumb #c9d1d9): `text` from (x, top), the
+ * track `width` px long below it, the thumb at `t` (0..1) along it (the text from `textX`, if
+ * given). Returns the track's hit area (frame px, generous vertically); x maps linearly from its
+ * left (t = 0) to its right (t = 1). */
+export function slider(q: Quads, font: FontSize, x: number, top: number, width: number, text: string, t: number, s: number, textX = x, hot = false): [number, number, number, number] {
   x = Math.round(x);
-  q.text(`ⁿ√  n = ${n.toFixed(2)}`, x, top, font, premul("#c9d1d9"), "lt");
+  q.text(text, Math.round(textX), top, font, premul("#c9d1d9"), "lt");
   const y = Math.round(top + font.ascent + font.descent + 8 * s); // track centre
   const th = Math.max(Math.round(2 * s), 2);
   q.rect(x, y - th / 2, width, th, premul("#8b949e"), { radius: th / 2 });
-  q.dot(x + ((n - min) / (max - min)) * width, y, 9 * s, 2 * s, premul("#c9d1d9"), premul("#101216")); // big enough to grab
+  q.dot(x + t * width, y, (hot ? 12 : 9) * s, 2 * s, premul("#c9d1d9"), premul("#101216")); // big enough to grab; bigger under the pointer
   const reach = Math.round(12 * s);
-  return { rect: [x, y - reach, x + Math.round(width), y + reach], min, max, step, value: n };
+  return [x, y - reach, x + Math.round(width), y + reach];
+}
+
+/** control.sliderHot of the root slider (parameter names are identifiers, so never this). */
+export const ROOT_HOT = "ⁿ√";
+
+/** Slider of the root colour scale's `n`: its label `ⁿ√  n = 3.00` from (x, top), the track
+ * `width` px long below it. */
+export function rootSlider(q: Quads, font: FontSize, x: number, top: number, width: number, n: number, s: number, hot = false): RootSlider {
+  const { min, max, step } = ROOT_N;
+  return { rect: slider(q, font, x, top, width, `ⁿ√  n = ${n.toFixed(2)}`, (n - min) / (max - min), s, x, hot), min, max, step, value: n };
 }
 
 // --- Pipelines -------------------------------------------------------------------------------
