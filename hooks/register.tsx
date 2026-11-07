@@ -832,8 +832,17 @@ export const register: Register = (on, options) => {
     return {}
   })
 
-  on('tool.call', { tool: VIEW_TOOL }, async ($, e) =>
-    showView($, e, 'surface', ['surface', 'colorBy', 'colormap', 'azimuth', 'elevation', 'zoom', 'knotLines']))
+  on('tool.call', { tool: VIEW_TOOL }, async ($, e) => {
+    const input = e as any
+    if (input.nurbs !== undefined) { // a surface of Claude's own: it replaces the named one
+      const size = JSON.stringify(input.nurbs).length
+      if (size > 64_000) return { deny: `nurbs is ${size} bytes; keep it under 64 kB (an exact low-degree patch, or a coarse control net)` }
+    }
+    const e2 = input.nurbs !== undefined ? { ...input, surface: input.nurbs } : { ...input }
+    // a named surface (or a new nurbs) starts with the renderer's own colour range unless one is given
+    if (input.surface !== undefined || input.nurbs !== undefined) e2.domain ??= null
+    return showView($, e2, 'surface', ['surface', 'colorBy', 'colormap', 'invertColorMap', 'domain', 'azimuth', 'elevation', 'zoom', 'knotLines'])
+  })
 
   on('tool.call', { tool: OPEN_TOOL }, async ($, e) => {
     const all = await entries($)
@@ -910,9 +919,18 @@ export const register: Register = (on, options) => {
       inputSchema: {
         type: 'object',
         properties: {
-          surface: { type: 'string', enum: SURFACES, description: 'dini and breather: pseudospherical surfaces (curvature -1), coloured by height / the sine-Gordon angle' },
+          surface: { type: 'string', enum: SURFACES, description: 'a built-in surface; dini and breather: pseudospherical (curvature -1), coloured by height / the sine-Gordon angle' },
+          nurbs: {
+            type: 'object',
+            description: 'a surface of your own instead of `surface`: {degrees: [p, q], shape: [nu, nv], points: flat xyz (nu*nv*3, u outer), ' +
+              'weights: nu*nv, knots: [u knots (nu+p+1), v knots (nv+q+1)], fields?: [nu*nv control values]}. A polynomial graph z = f(x, y) ' +
+              'is exactly a Bezier patch (Bernstein coefficients); colour by `field` for a scalar on it (e.g. det of the Hessian), ' +
+              'or by gaussian-/mean-curvature',
+          },
           colorBy: { type: 'string', enum: ['field', 'height', 'field-gradient', 'height-gradient', 'gaussian-curvature', 'mean-curvature'] },
-          colormap: { type: 'string', enum: ['viridis', 'magma', 'inferno', 'plasma'] },
+          colormap: { type: 'string', enum: [...SEQUENTIAL_MAPS, ...DIVERGING_MAPS, ...CYCLICAL_MAPS].map((m) => m.toLowerCase()), description: 'diverging maps (rdbu, puor, ...) for signed values, with a symmetric `domain`' },
+          invertColorMap: { type: 'boolean' },
+          domain: { type: ['array', 'null'], items: { type: 'number' }, description: '[lo, hi] of the colour map; null: the renderer\'s own (2nd-98th percentile)' },
           azimuth: { type: 'number', description: 'degrees' },
           elevation: { type: 'number', description: 'degrees, -89..89' },
           zoom: { type: 'number', description: 'relative to the auto-fit framing (1)' },

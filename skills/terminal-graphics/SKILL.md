@@ -16,7 +16,7 @@ has a visible effect, render the alternatives side by side and show them before 
 |---|---|
 | A PNG you made (matplotlib, a renderer, a screenshot) | `mcp__sciviz__show` with the absolute `path` (and a one-line `caption`) |
 | An interactive view of a gallery entry (lines, curves, complex, volumes...) | `mcp__sciviz__gallery_open` with its `id` (fuzzy names work: `blocks`, `lorenz`); `control` overrides fields (window `x0`/`x1`, camera `azimuth`/`elevation`/`zoom`, `colormap`) |
-| A live 3D NURBS surface | `mcp__sciviz__view` |
+| A live 3D surface: built-in (`torus`, `sphere`, `wave`, `dini`, `breather`) or **your own** | `mcp__sciviz__view` with `surface`, or with `nurbs` (see below) |
 | A live PCHIP interpolation plot | `mcp__sciviz__plot` |
 
 Live views render on the GPU (WebGPU) and stream frames into the chat. **The newest view is live;
@@ -24,10 +24,31 @@ earlier ones freeze** on their last settled frame, so the conversation keeps a v
 Every live-view tool returns a `snapshot` PNG path: **Read it** to see exactly what the user sees
 before you talk about it, and the renderer `state` (window, value ranges, camera, hover).
 
-Tell the user how to drive a live view the first time: drag (pan in 2D, orbit in 3D),
+In 3D views only the object itself takes the mouse; the user can select text in the empty space
+around it. Tell the user how to drive a live view the first time: drag (pan in 2D, orbit in 3D),
 shift-drag or `+`/`-` (zoom), hover (values drawn next to the cursor), click the view then
 `c`/`C` (cycle colour maps within their group), `i` (invert), `r` (reset). Their one slash command:
 `/sciviz [section]` shows a contact sheet, `/sciviz <entry>` (e.g. `lorenz`) opens a live view.
+
+## Where to compute the data
+
+Compute as close to the renderer as you can, in this order:
+
+1. **On the GPU, by the renderer.** Gallery entries and generator specs (`fn: {name: "besselJ", order: 3}`,
+   ODEs, orbitals, complex functions) are evaluated in compute shaders. The data never leaves the
+   GPU and is re-sampled live as the user pans and zooms. Reach for an existing entry and override
+   its `control` before anything else.
+2. **Exactly, as a NURBS.** Many surfaces have an exact rational form, and you can pass it to `view` as
+   `nurbs`. A polynomial graph z = f(x, y) of degree (p, q) is one Bézier patch: x and y are
+   linear in the parameters, and z's control values are f's Bernstein coefficients (solve the
+   (p+1)-point collocation in each direction). Scalar fields go in `fields` in the same basis, e.g.
+   det ∇²f to show a saddle, coloured with a diverging map (`rdbu`, `invertColorMap: true`, symmetric
+   `domain`). Revolved and conic shapes are exact with rational weights. The renderer evaluates it,
+   normals and curvature included, on the GPU.
+3. **Only for data that exists as measurements:** compute it elsewhere and send arrays, or plot a
+   PNG and `show` it. Don't sample a mathematical function in Python and ship its values as JSON
+   when tier 1 or 2 can draw it: that path can't re-sample when the user zooms, and the arrays
+   flood the control.
 
 ## Making images that look right in the terminal
 
@@ -57,7 +78,8 @@ shift-drag or `+`/`-` (zoom), hover (values drawn next to the cursor), click the
   terminal raw, so nothing renders. Use `show`.
 - Don't put big data arrays into a live view's `control` overrides: the control is rewritten on
   every pointer event. Entries carry small generator specs (e.g. an ODE or a function name) that
-  the renderer evaluates on the GPU.
+  the renderer evaluates on the GPU. A `nurbs` surface should be a small exact patch or a coarse
+  control net (under 64 kB), not a dense sample grid.
 - Don't open a new live view for every small change: one view the user drives is better than five
   frozen ones. Change parameters with the tool's `control` only when the user asks or you're
   showing something specific.

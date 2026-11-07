@@ -87,7 +87,7 @@ export const entries: Entry[] = [
     title: "Fermi surface",
     description: "E(k) = E_F of a simple cubic tight-binding band (t = 1, t' = 0.3 eV) at half filling, as an isosurface over the band volume",
     renderer: "volume.ts",
-    control: { volume: { dataset: "fermi", size: 64 }, colormap: "Twilight", valueLabel: "𝐸 (eV)" }, // iso level, centre, title: E_F (the median)
+    control: { volume: { dataset: "fermi", size: 64 }, colormap: "Twilight", valueLabel: "𝐸 (eV)", scale: "root", rootN: 3 }, // iso level, centre, title: E_F (the median)
     interaction: "orbit",
   },
 ];

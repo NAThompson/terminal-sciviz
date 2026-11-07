@@ -17903,7 +17903,9 @@
         "size": 64
       },
       "colormap": "Twilight",
-      "valueLabel": "𝐸 (eV)"
+      "valueLabel": "𝐸 (eV)",
+      "scale": "root",
+      "rootN": 3
     },
     "interaction": "orbit"
   }

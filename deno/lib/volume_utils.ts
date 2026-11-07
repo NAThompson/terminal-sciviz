@@ -3,7 +3,7 @@
 import { createScale, type Domain, getShaderScale, type VisScale } from "./scales.ts";
 
 export type Quality = "low" | "medium" | "high";
-export const SAMPLES_PER_VOXEL: Record<Quality, number> = { low: 0.5, medium: 1, high: 2 }; // halved while interacting
+export const SAMPLES_PER_VOXEL: Record<Quality, number> = { low: 1, medium: 4, high: 8 }; // halved while interacting
 
 const UNIFORMITY_TOLERANCE = 1e-2;
 const FLOAT_PRECISION = 2 ** -20;

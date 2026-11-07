@@ -369,7 +369,7 @@ export function rootSlider(q: Quads, font: FontSize, x: number, top: number, wid
   const y = Math.round(top + font.ascent + font.descent + 8 * s); // track centre
   const th = Math.max(Math.round(2 * s), 2);
   q.rect(x, y - th / 2, width, th, premul("#8b949e"), { radius: th / 2 });
-  q.dot(x + ((n - min) / (max - min)) * width, y, 5 * s, 1.5 * s, premul("#c9d1d9"), premul("#101216"));
+  q.dot(x + ((n - min) / (max - min)) * width, y, 9 * s, 2 * s, premul("#c9d1d9"), premul("#101216")); // big enough to grab
   const reach = Math.round(12 * s);
   return { rect: [x, y - reach, x + Math.round(width), y + reach], min, max, step, value: n };
 }
