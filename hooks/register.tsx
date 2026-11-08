@@ -47,7 +47,7 @@ function cellSize(s: Shown, viewport?: { columns: number; rows: number }) {
 
 
 // ---- live views, inline in the transcript, each kind drawn by its own GPU renderer process ----
-// surface: deno/surface.ts, pchip: deno/plot1d.ts; gallery entries: deno/{line,curve,complex,volume}.ts (all WebGPU).
+// surface: deno/surface.ts, pchip: deno/plot1d.ts; gallery entries: deno/{line,curve,complex,volume,scene}.ts (all WebGPU).
 // Protocol: control.json carries an increasing `rev`; frame lines are `frame <gen> <w> <h> <shm|-> <rev>`;
 // a snapshot request {path, rev} is acknowledged by `snapshot <rev> <path>` once a frame at/after rev
 // is saved. Writes are coalesced (the renderer retries a torn file and ignores stale revs).
@@ -59,6 +59,8 @@ const PLOT_TOOL = 'mcp__sciviz__plot'
 const OPEN_TOOL = 'mcp__sciviz__gallery_open'
 const CHART_TOOL = 'mcp__sciviz__chart'
 const CHART_KEYS = ['title', 'subtitle', 'xlabel', 'ylabel', 'x', 'y', 'series', 'marks', 'color', 'r', 'overlays', 'legend', 'endLabels', 'x0', 'x1', 'ymin', 'ymax', 'sliders']
+const SCENE_TOOL = 'mcp__sciviz__scene'
+const SCENE_KEYS = ['title', 'subtitle', 'marks', 'xlabel', 'ylabel', 'zlabel', 'aspect', 'color', 'r', 'legend', 'axes', 'azimuth', 'elevation', 'zoom']
 // Resolved at session start (resolvePaths): ROOT holds deno/ (the plugin's own folder once installed,
 // or the projectDir option); RUN is per-user state (control files, frames, snapshots).
 let ROOT = ''
@@ -97,7 +99,7 @@ type Entry = { id: string; section: string; title: string; description: string; 
 let GALLERY = ''
 /** The last live view's size (cells and frame px), so a tool call's first snapshot after a reload is full size. */
 const SIZE_FILE = () => `${denoSearch.home}/.cache/terminal-sciviz/view-size.json`
-const SECTIONS = ['lines', 'curves', 'complex', 'volumes']
+const SECTIONS = ['lines', 'curves', 'complex', 'volumes', 'scenes']
 
 const KINDS: Record<Kind, { script: string; ctl: Ctl }> = {
   surface: { script: 'surface.ts', ctl: { surface: 'wave', ...HOME, colormap: 'viridis', colorBy: 'field', knotLines: false } },
@@ -133,7 +135,7 @@ const view = { live: '', liveMinRev: 0, intended: '', cols: 80, rows: 25, pxW: 9
 const cycle = (list: string[], cur: string) => list[(list.indexOf(cur) + 1) % list.length]
 const viewPng = (id: string) => `${VIEWS}/${id.replace(/[^A-Za-z0-9_-]/g, '_')}.png`
 const liveKind = (): Kind | undefined => kindOf[view.live]
-const legacyInteraction = (kind: Kind): Interaction => (kind === 'surface' ? 'orbit' : 'pan-zoom-x')
+const legacyInteraction = (kind: Kind): Interaction => (kind === 'surface' || kind === 'g-scene' ? 'orbit' : 'pan-zoom-x')
 
 let manifest: Entry[] | null = null
 /** The gallery's entries (gallery.ts manifest), cached; `fresh` re-reads it (new entries since load). */
@@ -994,6 +996,22 @@ export const register: Register = (on, options) => {
     return showView($, input, kind, CHART_KEYS, fresh ? { title: '', series: [] } : undefined)
   })
 
+  on('tool.call', { tool: SCENE_TOOL }, async ($, e) => {
+    const input = e as any
+    const size = JSON.stringify(input.marks ?? null).length // as chart: past 64 kB, data goes in files
+    if (size > 64_000) return { deny: `marks are ${size} bytes inline; keep them under 64 kB: write the data to a .json/.csv/.tsv file and give each mark \`file\` (absolute path) instead of inline data` }
+    for (const m of Array.isArray(input.marks) ? input.marks : []) {
+      const f = m?.file
+      if (f === undefined) continue
+      if (typeof f !== 'string' || !f.startsWith('/') || !/\.(json|csv|tsv)$/i.test(f)) return { deny: `file must be an absolute path to a .json, .csv or .tsv file: ${f}` }
+      if (!(await $.fs.exists(f))) return { deny: `no such file: ${f}` }
+    }
+    // new `marks`: a new scene (fields not given: defaults); without, the fields given change the current one
+    const kind = galleryKind('scene.ts')
+    if (input.marks === undefined && !Array.isArray(KINDS[kind]?.ctl.marks)) return { deny: 'no scene open yet: pass `marks`' }
+    return showView($, input, kind, SCENE_KEYS, input.marks !== undefined ? { title: '' } : undefined)
+  })
+
   on('tool.call', { tool: PLOT_TOOL }, async ($, e) =>
     showView($, e, 'pchip', ['function', 'n', 'x0', 'x1', 'ymin', 'ymax', 'showTrue', 'showSamples', 'compare']))
 
@@ -1187,6 +1205,66 @@ export const register: Register = (on, options) => {
       isDeferred: false,
     })
     await $.tool.register({
+      name: 'scene',
+      description:
+        'Show the user a live 3D scene of your own data inline in the chat, right here between your text (WebGPU; they drag to orbit, ' +
+        'shift-drag/+/- to zoom, hover a point for its row, r resets). Built from `marks` like `chart`: dot (3D scatter, point clouds: ' +
+        'shaded spheres, 10⁵ points stay fast), line (3D polylines), mesh (triangles), each over `data` columns or a `file`. ' +
+        'Examples: scatter {type:"dot", data, x:"a", y:"b", z:"c", fill:"species"}; point cloud coloured by a value {type:"dot", file, fill:"t", r:1.5}; ' +
+        'convex hull over points {type:"dot", data, transform:{hull:true}} plus the points themselves as a second dot mark; ' +
+        'surface mesh {type:"mesh", vertices:[[x,y,z],...], faces:[[i,j,k],...], shading:"smooth"}. ' +
+        'Axes: a box with ticks on the edges facing the camera, equal aspect unless `aspect`. A call with `marks` opens a new scene; ' +
+        'without, it changes only the fields given (camera, title, aspect...). Waits for the frame and returns the control, renderer state ' +
+        '(camera, box, hover row) and a PNG snapshot path you can Read to see what the user sees.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          title: { type: 'string' },
+          subtitle: { type: 'string', description: 'dimmer text after the title' },
+          marks: {
+            type: 'array',
+            description: 'drawn together, depth-tested; translucent ones (opacity < 1) after the opaque, so what is behind them shows through dimmed',
+            items: {
+              type: 'object',
+              properties: {
+                type: { type: 'string', enum: ['dot', 'line', 'mesh'], description: 'dot: x, y, z (fill, r); line: x, y, z in row order, one polyline per `group`; mesh: vertices + faces, or x, y, z columns + faces (row indices)' },
+                data: { description: 'columns {name: [...], ...} (one length) or rows [{name: value, ...}, ...]; null: a gap' },
+                file: { type: 'string', description: 'instead of data: absolute path to a .csv/.tsv with a header row or .json (columns or rows); for more than 64 kB' },
+                x: { type: ['string', 'number'], description: 'a column name or a constant (default: the column "x")' },
+                y: { type: ['string', 'number'] }, z: { type: ['string', 'number'] },
+                fill: { type: 'string', description: 'colour: a column (strings: categories, Okabe–Ito, a legend entry each, at most 7; numbers: the colormap and a colour bar) or #rrggbb; stroke is the same channel' },
+                stroke: { type: 'string' },
+                r: { type: ['string', 'number'], description: 'dot radius: CSS px (3) or a column (sqrt scale, top-level `r`)' },
+                group: { type: 'string', description: 'line: a column splitting rows into polylines (default: a categorical fill)' },
+                opacity: { type: 'number', description: '0..1 (hull: 0.35)' },
+                width: { type: 'number', description: 'line and edge width, CSS px (line 2, edges 1)' },
+                vertices: { type: 'array', items: { type: 'array', items: { type: 'number' } }, description: 'mesh: [[x, y, z], ...]' },
+                faces: { type: 'array', items: { type: 'array', items: { type: 'integer' } }, description: 'mesh: [[i, j, k], ...] vertex/row indices, counter-clockwise seen from outside' },
+                shading: { type: 'string', enum: ['flat', 'smooth'], description: 'mesh (default flat; smooth: averaged vertex normals)' },
+                edges: { type: ['boolean', 'string'], description: 'mesh: draw its edges (true, or a #rrggbb colour)' },
+                transform: { type: 'object', description: '{hull: true}: the 3D convex hull of the points as a mesh (≥ 4 non-coplanar points)' },
+                label: { type: 'string', description: 'legend entry of a mark without categorical fill' },
+                legend: { type: 'boolean' },
+              },
+              required: ['type'],
+            },
+          },
+          xlabel: { type: 'string', description: 'default: the x column\'s name' },
+          ylabel: { type: 'string' },
+          zlabel: { type: 'string' },
+          aspect: { type: ['string', 'array'], items: { type: 'number' }, description: '"equal" (default: one unit the same length on every axis), "auto" (each axis normalised to a cube) or [ax, ay, az]' },
+          color: { type: 'object', description: '{scheme?: a colormap (viridis, magma, turbo, twilight, rdbu, ...) for numeric fill, domain?: [lo, hi] or the categories in order, label?: colour bar title, invert?}' },
+          r: { type: 'object', description: '{range?: [2, 12] CSS px, domain?: [0, max]}' },
+          legend: { type: 'boolean' },
+          axes: { type: 'boolean', description: 'false: no box, grid or ticks' },
+          azimuth: { type: 'number', description: 'degrees (35)' },
+          elevation: { type: 'number', description: 'degrees, -89..89 (25)' },
+          zoom: { type: 'number', description: 'relative to the auto-fit framing (1)' },
+        },
+      },
+      isDeferred: false,
+    })
+    await $.tool.register({
       name: 'plot',
       description:
         'Show the user a live, interactive PCHIP interpolation plot inline in the chat, right here between your text ' +
@@ -1287,16 +1365,16 @@ export const register: Register = (on, options) => {
   // A view's call row (`sciviz - chart (MCP)(title: ..., series: [...])`) is code in the middle of
   // the explanation: the figure stands alone between the text. ctrl+o (expanded) and errors show it.
   on('ui.render', { component: 'ToolUse' }, async ($, e, next) => {
-    const views = [VIEW_TOOL, PLOT_TOOL, OPEN_TOOL, CHART_TOOL]
+    const views = [VIEW_TOOL, PLOT_TOOL, OPEN_TOOL, CHART_TOOL, SCENE_TOOL]
     if (!views.includes(e.props.tool) || e.props.isExpanded || e.props.isErrored || e.surface !== 'terminal') return next(e)
     const { Box } = $.ui.resolve(e)
     return <Box />
   })
 
   on('ui.render', { component: 'ToolResult' }, async ($, e, next) => {
-    if ((e.props.tool === VIEW_TOOL || e.props.tool === PLOT_TOOL || e.props.tool === OPEN_TOOL || e.props.tool === CHART_TOOL) && !e.props.isErrored && e.surface === 'terminal') {
+    if ([VIEW_TOOL, PLOT_TOOL, OPEN_TOOL, CHART_TOOL, SCENE_TOOL].includes(e.props.tool) && !e.props.isErrored && e.surface === 'terminal') {
       // after a reload kindOf is empty: these rows are all frozen PNGs then, but they need their kind
-      let kind = kindOf[e.props.tool_use_id] ?? (e.props.tool === VIEW_TOOL ? 'surface' : e.props.tool === PLOT_TOOL ? 'pchip' : e.props.tool === CHART_TOOL ? galleryKind('line.ts') : undefined)
+      let kind = kindOf[e.props.tool_use_id] ?? (e.props.tool === VIEW_TOOL ? 'surface' : e.props.tool === PLOT_TOOL ? 'pchip' : e.props.tool === CHART_TOOL ? galleryKind('line.ts') : e.props.tool === SCENE_TOOL ? galleryKind('scene.ts') : undefined)
       if (!kind && e.props.tool === OPEN_TOOL) {
         const out = e.props.output as any
         const id = (out?.entry ?? JSON.stringify(out).match(/\\?"entry\\?":\\?"([^"\\]+)/)?.[1]) as string | undefined

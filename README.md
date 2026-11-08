@@ -10,7 +10,7 @@ snapshot of exactly what you see.
 ## What's in it
 
 - **A Claude Code plugin** (`sciviz`): tools Claude calls to show images (`show`) and to open live
-  views (`chart`, `gallery_open`, `view`, `plot`); one slash command for you (`/sciviz`); and a skill, `/sciviz:terminal-sciviz`, that teaches Claude how to
+  views (`chart`, `scene`, `gallery_open`, `view`, `plot`); one slash command for you (`/sciviz`); and a skill, `/sciviz:terminal-sciviz`, that teaches Claude how to
   present graphics well in a terminal (transparent backgrounds, theme colours, native resolution,
   side-by-side comparisons).
 - **WebGPU renderers** (`deno/`), headless, one process per kind of view:
@@ -20,9 +20,10 @@ snapshot of exactly what you see.
   - `surface.ts`: NURBS surfaces evaluated in a compute shader, coloured by field, height or curvature.
   - `complex.ts`: domain colouring of complex functions, evaluated per pixel.
   - `volume.ts`: ray-marched volumes and GPU marching-cubes isosurfaces.
+  - `scene.ts`: 3D marks: point clouds as sphere impostors, polylines, meshes, convex hulls.
   - Function curves (Bessel functions, expressions, …) are sampled in f64 by Boost.Math's
     WebAssembly build, orbitals by compute shaders; text is drawn from a signed-distance-field font on the GPU.
-- **A gallery** of 38 entries (lines, curves, complex, volumes) that doubles as a regression test.
+- **A gallery** of 60 entries (lines, curves, complex, volumes, scenes) that doubles as a regression test.
 - `overlay/`: an experimental native macOS window that draws WebGPU straight to the screen over
   the chat at the display's refresh rate.
 
@@ -53,7 +54,7 @@ Then ask Claude to show you something (“plot the Lorenz attractor”, “show 
 
 | Command | Shows |
 |---|---|
-| `/sciviz [lines\|curves\|complex\|volumes]` | that section's contact sheet and entry ids |
+| `/sciviz [lines\|curves\|complex\|volumes\|scenes]` | that section's contact sheet and entry ids |
 | `/sciviz <entry>` | the entry as a live view; partial names work (`lorenz`, `chirp`, `blocks`) |
 | `/sciviz torus\|wave\|sphere\|dini\|breather` | a live NURBS surface (Dini and the sine-Gordon breather are bicubic interpolants of their parametrisations) |
 

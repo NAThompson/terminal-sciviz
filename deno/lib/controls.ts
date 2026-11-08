@@ -52,7 +52,7 @@ const RULES: [string, Check][] = [
   ["lineWidth", num(0, 64)],
   ["target", list(3, num())],
   ["domain", list(2)],
-  ["aspect", list(3, num(1e-6, 1e6))],
+  ["aspect", (v) => (v === "equal" || v === "auto" ? null : typeof v === "string" ? 'must be "equal", "auto" or [ax, ay, az]' : list(3, num(1e-6, 1e6))(v))], // scene.ts: also "equal" | "auto"
   ["isoLevels", list(16, num())],
   // line.ts series: sampled generators and data
   ["series", list(64)],

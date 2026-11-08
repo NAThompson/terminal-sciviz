@@ -3,7 +3,7 @@
 // renders it. The gallery harness renders every entry headlessly to PNG, builds contact sheets,
 // and compares against golden images; the Claude Code mod opens any entry as a live view.
 
-export type Section = "lines" | "curves" | "complex" | "volumes";
+export type Section = "lines" | "curves" | "complex" | "volumes" | "scenes";
 
 export interface Entry {
   /** Stable id, also the golden image's file name: e.g. "lines/residual", "complex/rational". */

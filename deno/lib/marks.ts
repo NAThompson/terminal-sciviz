@@ -375,7 +375,12 @@ interface Ctx {
   yCats: string[];
   colorCats: Value[];
   color: { scheme: string; invert: boolean; domain: [number, number] } | null;
-  r: { range: [number, number]; max: number };
+  r: { range: [number, number]; domain: [number, number] };
+}
+
+/** Radius of `v` on a sqrt (area) scale from `domain` onto `range` (clamped; a collapsed domain: its low end). */
+export function sqrtRadius(v: number, [d0, d1]: [number, number], [r0, r1]: [number, number]): number {
+  return r0 + (r1 - r0) * Math.sqrt(Math.min(Math.max((v - d0) / (d1 - d0 || 1), 0), 1));
 }
 
 /** Marks compiled: their series (after `series`), the categories string x / y imply, the
@@ -422,7 +427,7 @@ export function compileMarks(marks: Mark[], axes: { x: AxisSpec; y: AxisSpec }, 
   const rs = stages.flatMap((st) => (st.names.r ? st.ch.r!.map(num) : []));
   const ctx: Ctx = {
     palette, ink, xCats, yCats: yAxis, colorCats, color,
-    r: { range: scales.r?.range ?? [2, 12], max: scales.r?.domain?.[1] ?? Math.max(0, finiteRange(rs)[1]) },
+    r: { range: scales.r?.range ?? [2, 12], domain: [scales.r?.domain?.[0] ?? 0, scales.r?.domain?.[1] ?? Math.max(0, finiteRange(rs)[1])] },
   };
   return {
     series: stages.flatMap((st) => compileStage(st, ctx)),
@@ -472,8 +477,7 @@ function compileStage(st: Stage, ctx: Ctx): Compiled[] {
     if (st.names.opacity) prims.alphas = idx.map((i) => Math.min(Math.max(num(ch.opacity![i]), 0), 1));
     else if (typeof m.opacity === "number" && ["dot", "text", "bar", "barX", "rect"].includes(m.type)) prims.alphas = idx.map(() => m.opacity as number);
     if (ch.r) {
-      const [r0, r1] = ctx.r.range;
-      prims.sizes = idx.map((i) => (st.names.r ? r0 + (r1 - r0) * Math.sqrt(Math.max(num(ch.r![i]), 0) / (ctx.r.max || 1)) : num(ch.r![i])));
+      prims.sizes = idx.map((i) => (st.names.r ? sqrtRadius(num(ch.r![i]), ctx.r.domain, ctx.r.range) : num(ch.r![i])));
     }
     prims.tips = idx.map((i) => tipRows(st, i));
 

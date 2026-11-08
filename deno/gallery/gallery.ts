@@ -29,13 +29,13 @@ const HERE = new URL("./", import.meta.url);
 const ROOT = new URL("../", import.meta.url);
 const INDEX = new URL("index.json", HERE);
 const DOCS = new URL("../../docs/", import.meta.url);
-const SECTIONS: Section[] = ["lines", "curves", "complex", "volumes"];
+const SECTIONS: Section[] = ["lines", "curves", "complex", "volumes", "scenes"];
 const INK = [0xc9, 0xd1, 0xd9], INK2 = [0x8b, 0x94, 0x9e];
 const MAX_TOL = 3, MEAN_TOL = 0.01;
 
 /** Entries of every section. Each module is required: a missing or broken one fails the run. */
 async function loadEntries(): Promise<Entry[]> {
-  const files = ["lines_entries.ts", "curves_entries.ts", "complex_entries.ts", "volumes_entries.ts"];
+  const files = ["lines_entries.ts", "curves_entries.ts", "complex_entries.ts", "volumes_entries.ts", "scenes_entries.ts"];
   const out: Entry[] = [];
   for (const f of files) {
     const mod = await import(new URL(f, HERE).href).catch((err) => {

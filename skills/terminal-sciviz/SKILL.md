@@ -1,6 +1,6 @@
 ---
 name: terminal-sciviz
-description: How to present graphics to the user inside the terminal chat with the sciviz mod — static images (mcp__sciviz__show), live interactive WebGPU views (mcp__sciviz__chart, mcp__sciviz__gallery_open, mcp__sciviz__view, mcp__sciviz__plot), and how to make plots that look right there. Use whenever a picture, plot, comparison, 3D view or interactive exploration would help the user, before writing any plotting code, and whenever you're tempted to describe something visual in words.
+description: How to present graphics to the user inside the terminal chat with the sciviz mod — static images (mcp__sciviz__show), live interactive WebGPU views (mcp__sciviz__chart, mcp__sciviz__scene, mcp__sciviz__gallery_open, mcp__sciviz__view, mcp__sciviz__plot), and how to make plots that look right there. Use whenever a picture, plot, comparison, 3D view or interactive exploration would help the user, before writing any plotting code, and whenever you're tempted to describe something visual in words.
 ---
 
 # Presenting graphics in the terminal
@@ -16,7 +16,8 @@ has a visible effect, render the alternatives side by side and show them before 
 |---|---|
 | A PNG you made (matplotlib, a renderer, a screenshot) | `mcp__sciviz__show` with the absolute `path` (and a one-line `caption`) |
 | A live chart of **your own** data or functions (scatter/bubble, lines, bars, areas, histograms, heatmaps, distributions, fits) | `mcp__sciviz__chart` with `marks`: each a type (`line`, `dot`, `bar`, `barX`, `area`, `rect`, `rule`, `text`, `interval`, `box`) over `data` columns (or a CSV/JSON `file` with a header, or a function `fn`), channels naming columns (`x`, `y`, `fill`, `r`, `z`, ...) and `transform`s (below). A later call without `marks`/`series` adjusts the same chart (window, title, scales). `series` is the older one-line-per-entry shorthand |
-| An interactive view of a gallery entry (lines, curves, complex, volumes...) | `mcp__sciviz__gallery_open` with its `id` (fuzzy names work: `blocks`, `lorenz`); `control` overrides fields (window `x0`/`x1`, camera `azimuth`/`elevation`/`zoom`, `colormap`) |
+| A live 3D scene of **your own** data: 3D scatter, point clouds, 3D polylines, triangle meshes, convex hulls | `mcp__sciviz__scene` with `marks` (`dot`, `line`, `mesh`) over `data` columns or a `file`, channels `x`, `y`, `z`, `fill`, `r` like `chart` (below) |
+| An interactive view of a gallery entry (lines, curves, complex, volumes, scenes...) | `mcp__sciviz__gallery_open` with its `id` (fuzzy names work: `blocks`, `lorenz`); `control` overrides fields (window `x0`/`x1`, camera `azimuth`/`elevation`/`zoom`, `colormap`) |
 | A live 3D surface: built-in (`torus`, `sphere`, `wave`, `dini`, `breather`, `teapot`) or **your own** | `mcp__sciviz__view` with `surface`, or with `nurbs` (one patch or an array of patches; see below) |
 | A live PCHIP interpolation plot | `mcp__sciviz__plot` |
 
@@ -82,6 +83,15 @@ stacked area `{type: "area", data, x: "year", y: "v", fill: "sector", transform:
 with `{type: "text", y: "lang", x: "x", text: "x", anchor: "lm", dx: 6, transform: {group: {sort: "desc"}}}`;
 heatmap `{type: "rect", x: "hour", y: "day", fill: "load"}`; a reference `{type: "rule", y: 0}`.
 Five or more labelled lines also get their names at their right ends (`endLabels: false|true` overrides).
+
+**3D data: `scene`.** Its marks work like `chart`'s, with a `z` channel: `{type: "dot", data, x, y, z,
+fill: "species"}` (categories, legend) or `fill: "t"` (colour map and bar), `r` px or a column; dots
+are shaded spheres, fast to 10⁵ points (give a `file` past 64 kB). `line` draws polylines in row
+order, one per `group` (default: a categorical fill). `mesh` takes `vertices` + `faces` (or x/y/z
+columns + `faces`), `shading: "smooth"`, `edges: true`, `opacity` (translucent meshes let what's
+behind them show, dimmed). `transform: {hull: true}` on a dot mark draws its convex hull; add the
+points again as a second dot mark to see them inside. Equal aspect by default; `aspect: "auto"`
+when the axes have unrelated units. Hover reports the point's row. Use `chart` for anything 2D.
 
 **Distributions and fits: pass raw data with a transform**, not bins or quantiles you computed:
 `bin` (`width`/`thresholds`, `reduce: count|density|proportion`) under a `bar` (histogram) or a

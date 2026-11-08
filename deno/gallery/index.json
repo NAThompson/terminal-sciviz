@@ -31384,5 +31384,92 @@
       "rootN": 3
     },
     "interaction": "orbit"
+  },
+  {
+    "id": "scenes/convex_hull",
+    "section": "scenes",
+    "title": "convex hull",
+    "description": "100 random points in a ball and their convex hull (quickhull, f64): translucent, the points behind it dimmed",
+    "renderer": "scene.ts",
+    "control": {
+      "title": "convex hull",
+      "subtitle": "100 points in a ball",
+      "marks": [
+        {
+          "type": "dot",
+          "gen": {
+            "name": "ball",
+            "n": 100,
+            "seed": 11
+          },
+          "transform": {
+            "hull": true
+          }
+        },
+        {
+          "type": "dot",
+          "gen": {
+            "name": "ball",
+            "n": 100,
+            "seed": 11
+          },
+          "fill": "#E69F00",
+          "r": 4
+        }
+      ]
+    },
+    "interaction": "orbit"
+  },
+  {
+    "id": "scenes/torus_cloud",
+    "section": "scenes",
+    "title": "noisy torus",
+    "description": "20 000 points near a torus as shaded sphere impostors, coloured by their angle (cyclic Twilight map, colour bar)",
+    "renderer": "scene.ts",
+    "control": {
+      "title": "noisy torus",
+      "subtitle": "20 000 points",
+      "marks": [
+        {
+          "type": "dot",
+          "gen": {
+            "name": "torus",
+            "n": 20000,
+            "seed": 2
+          },
+          "fill": "angle",
+          "r": 1.6
+        }
+      ],
+      "color": {
+        "scheme": "twilight",
+        "label": "angle (°)"
+      }
+    },
+    "interaction": "orbit"
+  },
+  {
+    "id": "scenes/clusters",
+    "section": "scenes",
+    "title": "three clusters",
+    "description": "a categorical 3D scatter: three Gaussian clusters, Okabe–Ito colours and a legend",
+    "renderer": "scene.ts",
+    "control": {
+      "title": "three clusters",
+      "marks": [
+        {
+          "type": "dot",
+          "gen": {
+            "name": "clusters",
+            "n": 900,
+            "seed": 5
+          },
+          "fill": "cluster",
+          "r": 3
+        }
+      ],
+      "elevation": 20
+    },
+    "interaction": "orbit"
   }
 ]

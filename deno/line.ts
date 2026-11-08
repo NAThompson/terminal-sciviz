@@ -552,7 +552,7 @@ function seriesFile(path: string): { x: Float64Array; y: Float64Array } {
 /** A mark's data file (`Mark.file`), parsed once per path and mtime: JSON columns {name: [...]}
  * or rows [{...}], or a CSV/TSV with a header row (`parseDelimited`; numbers where they parse,
  * "" a gap). */
-function tableFile(path: string): Columns {
+export function tableFile(path: string): Columns {
   return cachedFile("mark", path, (text) => {
     if (/\.json$/i.test(path)) {
       const data = JSON.parse(text);
