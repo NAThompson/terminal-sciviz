@@ -1,7 +1,8 @@
 // The "volumes" section: hydrogen orbitals, a 4D stack and tight-binding bands, generated on the GPU by
 // volume.ts from small specs, with the datasets' display settings as controls: iso levels,
 // log / symlog / sqrt / root scales, value transform, a non-uniform axis, a 4D stack (`slice`, stepped
-// by the live view), a 3D signal and a Fermi surface.
+// by the live view), a 3D signal and a Fermi surface; and a 4D stack read from a file (a .npy in
+// assets/, made by tools/make_ball_modes.ts) with a slice slider.
 
 import type { Entry } from "./types.ts";
 
@@ -88,6 +89,21 @@ export const entries: Entry[] = [
     description: "E(k) = E_F of a simple cubic tight-binding band (t = 1, t' = 0.3 eV) at half filling, as an isosurface over the band volume",
     renderer: "volume.ts",
     control: { volume: { dataset: "fermi", size: 64 }, colormap: "Twilight", valueLabel: "𝐸 (eV)", scale: "root", rootN: 3 }, // iso level, centre, title: E_F (the median)
+    interaction: "orbit",
+  },
+  {
+    id: "volumes/file_slices",
+    section: "volumes",
+    title: "vibrating ball",
+    description: "a 4D stack from a .npy file (11 × 24³, NaN outside the ball: transparent), an in-frame slider over 𝑡",
+    renderer: "volume.ts",
+    control: {
+      volume: {
+        dataset: "file", path: "assets/ball_modes.npy",
+        axes: [{ lo: -1, hi: 1, label: "𝑥" }, { lo: -1, hi: 1, label: "𝑦" }, { lo: -1, hi: 1, label: "𝑧" }, { lo: 0, hi: 1, label: "𝑡" }],
+      },
+      slice: 2, title: "vibrating ball", subtitle: "𝑗₀(𝜋𝑟) cos 2𝜋𝑡 + 𝑗₁ cos 𝜃 sin 2𝜋𝑡", colormap: "RdBu", symmetric: true, valueLabel: "𝑢", up: "z",
+    },
     interaction: "orbit",
   },
 ];

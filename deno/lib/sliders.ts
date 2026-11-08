@@ -3,13 +3,14 @@
  * parameters of the plot (an fn's expr params or a named generator's arguments, an ODE's
  * coefficients); `sliderValues: {name: v}` (written by the mod as the user drags) overrides them.
  * Drawn into the frame (overlay.ts `slider`) and reported in state.json `sliders` with their hit
- * rects, so the mod can hit-test them.
+ * rects, so the mod can hit-test them. A slider named after a data slice (a mark's `slice` column,
+ * a volume's leading dimension) selects one of that slice's `values` (distinct, sorted) instead.
  */
 
 import { type FontSize, type Quads, rootSliderHeight, slider } from "./overlay.ts";
 import { GENERATORS } from "./generators.ts";
 
-export interface SliderDef { name: string; label: string; min: number; max: number; step: number; value: number }
+export interface SliderDef { name: string; label: string; min: number; max: number; step: number; value: number; values?: number[] }
 /** As drawn: the track's hit area (frame px), x linear from rect[0] (min) to rect[2] (max). */
 export interface Slider extends SliderDef { rect: [number, number, number, number] }
 /** Where a parameter lives in a (copied) control: `obj[key]`, its current value. */
@@ -35,14 +36,34 @@ export function fnParams(spec: unknown): Param[] {
   return g ? g.args.map((a, i) => ({ name: a, obj: s, key: a, value: s[a] === undefined ? g.defaults[i] : Number(s[a]) })) : [];
 }
 
+/** The value of `values` (sorted) nearest `v`. */
+export function nearestValue(values: ArrayLike<number>, v: number): number {
+  let best = values[0];
+  for (let i = 1; i < values.length; i += 1) if (Math.abs(values[i] - v) < Math.abs(best - v)) best = values[i];
+  return best;
+}
+
 /** The sliders of `sliders` over `params` (all of a name set to its value: `values`' if given,
- * else the parameter's own, clamped to the range). Throws on a bad spec or an unknown name. */
-export function resolveSliders(sliders: unknown, values: unknown, params: Param[]): SliderDef[] {
+ * else the parameter's own, clamped to the range), or over `slices` (name: distinct sorted values;
+ * `[min, max]` optional, keeping the values within; starts at the first). Throws on a bad spec or
+ * an unknown name. */
+export function resolveSliders(sliders: unknown, values: unknown, params: Param[], slices: Record<string, number[]> = {}): SliderDef[] {
   if (sliders === undefined || sliders === null) return [];
   if (typeof sliders !== "object" || Array.isArray(sliders)) throw new Error("sliders: {name: [min, max] | {min, max, step?, label?}}");
   const given = (values && typeof values === "object" ? values : {}) as Record<string, unknown>;
   return Object.entries(sliders as Record<string, unknown>).map(([name, spec]) => {
-    const o = (Array.isArray(spec) ? { min: spec[0], max: spec[1] } : spec ?? {}) as Record<string, unknown>;
+    const o = (Array.isArray(spec) ? { min: spec[0], max: spec[1] } : spec && typeof spec === "object" ? spec : {}) as Record<string, unknown>;
+    if (Object.hasOwn(slices, name)) {
+      const lo = o.min === undefined ? -Infinity : Number(o.min), hi = o.max === undefined ? Infinity : Number(o.max);
+      const vals = slices[name].filter((v) => v >= lo && v <= hi);
+      if (!vals.length) throw new Error(`sliders.${name}: no ${name} values in [${o.min}, ${o.max}]`);
+      let step = Infinity;
+      for (let i = 1; i < vals.length; i += 1) step = Math.min(step, vals[i] - vals[i - 1]);
+      const [min, max] = vals.length > 1 ? [vals[0], vals[vals.length - 1]] : [vals[0], vals[0] + 1];
+      const v = Number(given[name] ?? o.value ?? vals[0]);
+      const value = nearestValue(vals, Number.isFinite(v) ? v : vals[0]);
+      return { name, label: typeof o.label === "string" ? o.label : GREEK[name] ?? name, min, max, step: Number.isFinite(step) ? step : 1, value, values: vals };
+    }
     const [min, max] = [Number(o.min), Number(o.max)];
     if (!(Number.isFinite(min) && Number.isFinite(max) && Number.isFinite(max - min) && max > min)) throw new Error(`sliders.${name}: need finite [min, max] with min < max (and max − min finite)`);
     const step = o.step === undefined ? 10 ** Math.floor(Math.log10((max - min) / 100)) : Number(o.step);
@@ -50,7 +71,8 @@ export function resolveSliders(sliders: unknown, values: unknown, params: Param[
     const at = params.filter((p) => p.name === name);
     if (!at.length) {
       const names = [...new Set(params.map((p) => p.name))];
-      throw new Error(`sliders: no parameter "${name}" in this plot (${names.length ? `its parameters: ${names.join(", ")}` : "it has none"})`);
+      const cols = Object.keys(slices);
+      throw new Error(`sliders: no parameter "${name}" in this plot (${names.length ? `its parameters: ${names.join(", ")}` : "it has none"}${cols.length ? `; slice columns: ${cols.join(", ")}` : ""})`);
     }
     const v = Number(given[name] ?? at[0].value);
     const value = Math.min(max, Math.max(min, Number.isFinite(v) ? v : min));
@@ -62,10 +84,17 @@ export function resolveSliders(sliders: unknown, values: unknown, params: Param[
 /** Height (px) of a slider at scale `s`. */
 export const sliderHeight = rootSliderHeight;
 
+/** Fewest decimals (up to one past the step's) that show every value of a slice to 1% of the step. */
+function valueDigits(values: number[], step: number): number {
+  const cap = Math.min(6, Math.max(0, Math.ceil(-Math.log10(step)) + 1));
+  for (let d = 0; d < cap; d += 1) if (values.every((v) => Math.abs(Number(v.toFixed(d)) - v) <= step * 0.01)) return d;
+  return cap;
+}
+
 /** `defs` drawn from (x, top), each `width` px long, `gap` apart in a row or a column; `hot`: the one under the pointer. */
 export function drawSliders(q: Quads, font: FontSize, defs: SliderDef[], x: number, top: number, width: number, gap: number, s: number, column = false, hot?: unknown): Slider[] {
   return defs.map((d, i) => {
-    const digits = Math.min(6, Math.max(0, Math.ceil(-Math.log10(d.step) - 1e-9)));
+    const digits = d.values ? valueDigits(d.values, d.step) : Math.min(6, Math.max(0, Math.ceil(-Math.log10(d.step) - 1e-9)));
     const [sx, sy] = column ? [x, top + i * (sliderHeight(font, s) + gap)] : [x + i * (width + gap), top];
     const text = `${d.label} = ${d.value.toFixed(digits)}`;
     const tx = Math.min(sx, sx + width - q.measure(font, text)); // a long label ends with the track

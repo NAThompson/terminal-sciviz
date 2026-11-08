@@ -1,6 +1,6 @@
 {
   "name": "sciviz",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "description": "Live, interactive WebGPU scientific visualization inline in the Claude Code chat (lines, NURBS curves and surfaces, complex functions, volumes), plus inline images",
   "license": "MIT",
   "author": {

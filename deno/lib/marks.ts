@@ -8,6 +8,8 @@
  * Scales: string x / y become categories (x left to right, y top to bottom, in order of first
  * appearance); fill strings map to the palette in a fixed order (never cycled), fill numbers to a
  * colormap; r is a sqrt scale. z (default: a categorical fill) splits a mark into series.
+ * `slice` (a numeric column) splits a mark's rows by its value before the transforms: each value's
+ * series are tagged with it (`Compiled.slice`), and the renderer draws those of the slider's value.
  */
 
 import type { SeriesSpec } from "../line.ts";
@@ -51,6 +53,7 @@ export interface Mark {
   anchor?: Anchor; // text
   dx?: number; // text: CSS px
   dy?: number;
+  slice?: string; // a numeric column: only the rows at the slider of that name's value are drawn
 }
 
 type BinOpt = { thresholds?: number; width?: number; reduce?: "count" | "density" | "proportion" };
@@ -89,7 +92,7 @@ export interface Prims {
   fillY?: { y: number[]; lo: number[]; hi: number[]; opacity: number }; // x between lo and hi as functions of y
   tips?: [string, string][][]; // hover rows of each point
 }
-export type Compiled = SeriesSpec & Prims & { stats?: Record<string, number> };
+export type Compiled = SeriesSpec & Prims & { stats?: Record<string, number>; slice?: { name: string; value: number } };
 
 export interface ColorBar { label: string; scheme: string; invert: boolean; domain: [number, number] }
 
@@ -109,6 +112,7 @@ interface Stage {
   pending: Partial<Record<Ch, string>>; // names of a transform's outputs (e.g. fill: "y")
   stacked?: boolean;
   plain?: boolean; // z splits series only: too many groups for the palette, one colour
+  slice?: number; // the value of the mark's slice column its rows have
 }
 
 const num = (v: Value | undefined): number => (v === null || v === undefined || v === "" ? NaN : Number(v));
@@ -164,6 +168,26 @@ const fillIsZ = (st: Stage) => st.names.fill !== undefined && st.names.fill === 
 function take(st: Stage, idx: number[]): void {
   for (const k of Object.keys(st.ch) as Ch[]) st.ch[k] = idx.map((i) => st.ch[k]![i]);
   st.n = idx.length;
+}
+
+/** A mark's stage split by its slice column, one stage per value (ascending); the values join `slices`. */
+function sliceStages(st: Stage, cols: Columns | undefined, slices: Record<string, number[]>): Stage[] {
+  const name = st.m.slice!;
+  const col = typeof name === "string" && cols && Object.hasOwn(cols, name) ? cols[name] : undefined;
+  if (!col) throw new Error(`${st.where}: slice: "${name}" is not a column${cols ? ` (columns: ${Object.keys(cols).join(", ")})` : " (fn marks have none)"}`);
+  if (isCat(col)) throw new Error(`${st.where}: slice column "${name}" must be numeric`);
+  const by = new Map<number, number[]>();
+  col.forEach((v, i) => {
+    const x = num(v);
+    if (Number.isFinite(x)) (by.get(x) ?? by.set(x, []).get(x)!).push(i);
+  });
+  const values = [...by.keys()].sort((a, b) => a - b);
+  slices[name] = [...new Set([...(slices[name] ?? []), ...values])].sort((a, b) => a - b);
+  return values.map((v) => {
+    const part: Stage = { ...st, ch: { ...st.ch }, names: { ...st.names }, pending: { ...st.pending }, slice: v };
+    take(part, by.get(v)!);
+    return part;
+  });
 }
 
 /** Row indices per z value, in order of first appearance (one group without z). */
@@ -385,16 +409,19 @@ export function sqrtRadius(v: number, [d0, d1]: [number, number], [r0, r1]: [num
 
 /** Marks compiled: their series (after `series`), the categories string x / y imply, the
  * colour bar of a continuous fill. */
-export function compileMarks(marks: Mark[], axes: { x: AxisSpec; y: AxisSpec }, scales: Scales, palette: string[], ink: string, table: (path: string) => Columns): { series: Compiled[]; x: AxisSpec; y: AxisSpec; colorbar?: ColorBar; colors: Value[] } {
-  const stages = marks.map((m, i) => {
+export function compileMarks(marks: Mark[], axes: { x: AxisSpec; y: AxisSpec }, scales: Scales, palette: string[], ink: string, table: (path: string) => Columns): { series: Compiled[]; x: AxisSpec; y: AxisSpec; colorbar?: ColorBar; colors: Value[]; slices: Record<string, number[]> } {
+  const slices: Record<string, number[]> = Object.create(null);
+  const stages = marks.flatMap((m, i) => {
     const where = `marks[${i}] (${m?.type})`;
     if (!m || !["line", "dot", "bar", "barX", "area", "rect", "rule", "text", "interval", "box"].includes(m.type)) {
       throw new Error(`${where}: type must be one of line, dot, bar, barX, area, rect, rule, text, interval, box`);
     }
     if (m.fn && !["line", "area"].includes(m.type)) throw new Error(`${where}: fn works for line and area marks`);
-    const st = resolve(m, where, m.fn ? undefined : columns(m, where, table));
-    transform(st);
-    return st;
+    const cols = m.fn ? undefined : columns(m, where, table);
+    const st = resolve(m, where, cols);
+    const parts = m.slice === undefined ? [st] : sliceStages(st, cols, slices);
+    parts.forEach(transform);
+    return parts;
   });
   const seen = (cats: string[], col?: Value[]) => col?.forEach((v) => typeof v === "string" && !cats.includes(v) && cats.push(v));
   const xCats = [...(axes.x.categories ?? [])], yCats: string[] = [];
@@ -430,11 +457,17 @@ export function compileMarks(marks: Mark[], axes: { x: AxisSpec; y: AxisSpec }, 
     r: { range: scales.r?.range ?? [2, 12], domain: [scales.r?.domain?.[0] ?? 0, scales.r?.domain?.[1] ?? Math.max(0, finiteRange(rs)[1])] },
   };
   return {
-    series: stages.flatMap((st) => compileStage(st, ctx)),
+    series: stages.flatMap((st) => {
+      const out = compileStage(st, ctx);
+      if (st.slice === undefined) return out;
+      const slice = { name: st.m.slice!, value: st.slice };
+      return out.map((c) => ({ ...c, slice, tips: c.tips?.map((rows) => [...rows, [slice.name, f4(slice.value)] as [string, string]]) }));
+    }),
     x: xCats.length ? { ...axes.x, categories: xCats } : axes.x,
     y: yCats.length ? { ...axes.y, categories: yAxis } : axes.y,
     colorbar: color ? { label: scales.color?.label ?? numericFill[0].names.fill ?? "", ...color } : undefined,
     colors: colorCats,
+    slices,
   };
 }
 

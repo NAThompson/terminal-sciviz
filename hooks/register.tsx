@@ -60,7 +60,10 @@ const OPEN_TOOL = 'mcp__sciviz__gallery_open'
 const CHART_TOOL = 'mcp__sciviz__chart'
 const CHART_KEYS = ['title', 'subtitle', 'xlabel', 'ylabel', 'x', 'y', 'series', 'marks', 'color', 'r', 'overlays', 'legend', 'endLabels', 'x0', 'x1', 'ymin', 'ymax', 'sliders']
 const SCENE_TOOL = 'mcp__sciviz__scene'
-const SCENE_KEYS = ['title', 'subtitle', 'marks', 'xlabel', 'ylabel', 'zlabel', 'aspect', 'color', 'r', 'legend', 'axes', 'azimuth', 'elevation', 'zoom']
+const SCENE_KEYS = ['title', 'subtitle', 'marks', 'xlabel', 'ylabel', 'zlabel', 'aspect', 'color', 'r', 'legend', 'axes', 'azimuth', 'elevation', 'zoom', 'sliders']
+const VOLUME_TOOL = 'mcp__sciviz__volume'
+const VOLUME_KEYS = ['volume', 'slice', 'sliders', 'title', 'subtitle', 'colormap', 'invertColormap', 'scale', 'rootN', 'symlogThreshold', 'domain', 'symmetric', 'center',
+  'mode', 'opacity', 'threshold', 'quality', 'isoLevels', 'isoColors', 'showVolume', 'showBox', 'showAxes', 'valueLabel', 'up', 'azimuth', 'elevation', 'zoom']
 // Resolved at session start (resolvePaths): ROOT holds deno/ (the plugin's own folder once installed,
 // or the projectDir option); RUN is per-user state (control files, frames, snapshots).
 let ROOT = ''
@@ -135,7 +138,7 @@ const view = { live: '', liveMinRev: 0, intended: '', cols: 80, rows: 25, pxW: 9
 const cycle = (list: string[], cur: string) => list[(list.indexOf(cur) + 1) % list.length]
 const viewPng = (id: string) => `${VIEWS}/${id.replace(/[^A-Za-z0-9_-]/g, '_')}.png`
 const liveKind = (): Kind | undefined => kindOf[view.live]
-const legacyInteraction = (kind: Kind): Interaction => (kind === 'surface' || kind === 'g-scene' ? 'orbit' : 'pan-zoom-x')
+const legacyInteraction = (kind: Kind): Interaction => (kind === 'surface' || kind === 'g-scene' || kind === 'g-volume' ? 'orbit' : 'pan-zoom-x')
 
 let manifest: Entry[] | null = null
 /** The gallery's entries (gallery.ts manifest), cached; `fresh` re-reads it (new entries since load). */
@@ -540,8 +543,10 @@ async function resolveCamera($: any, kind: Kind) {
   if (typeof ctl.zoom !== 'number') ctl.zoom = 1
 }
 
-/** `v` on a slider's grid (min + k step), rounded to the step's precision, then within its range. */
-const snapTo = (v: number, { min, max, step }: { min: number; max: number; step: number }) => {
+/** `v` on a slider's grid (min + k step), rounded to the step's precision, then within its range;
+ * a data slice's slider (`values`: distinct, sorted): the nearest value. */
+const snapTo = (v: number, { min, max, step, values }: { min: number; max: number; step: number; values?: number[] }) => {
+  if (Array.isArray(values) && values.length) return values.reduce((a, b) => (Math.abs(b - v) < Math.abs(a - v) ? b : a))
   const digits = Math.min(100, Math.max(0, Math.ceil(-Math.log10(step)) + 2))
   return Math.min(max, Math.max(min, Number((min + Math.round((v - min) / step) * step).toFixed(digits))))
 }
@@ -611,7 +616,9 @@ async function onPointer($: any, kind: Kind, ev: any) {
   void writeOverlay($, JSON.stringify({ seq: ++overlaySeq, type: ev.type, x, y, cols, rows,
     fine: !!ev.fine, drag: ev.type === 'down' || (!!view.drag && ev.type !== 'up' && ev.type !== 'leave'), kind, id: view.live }))
   const sliderAt = async () => {
-    if (!ctl.sliders && (Array.isArray(ctl.scale) ? ctl.scale[0] : ctl.scale) !== 'root') return null
+    // sliders: given, the root scale's, a mark's slice column's or a file volume's slice (added by the renderer)
+    const sliced = ctl.volume?.dataset === 'file' || (Array.isArray(ctl.marks) && ctl.marks.some((m: any) => m?.slice !== undefined))
+    if (!ctl.sliders && !sliced && (Array.isArray(ctl.scale) ? ctl.scale[0] : ctl.scale) !== 'root') return null
     let st: any = null
     try { st = JSON.parse(await $.fs.read(`${dir(kind)}/state.json`)) } catch { return null }
     // hit test in cells, at least a whole cell beyond the track on every side: the slider is under
@@ -1012,6 +1019,24 @@ export const register: Register = (on, options) => {
     return showView($, input, kind, SCENE_KEYS, input.marks !== undefined ? { title: '' } : undefined)
   })
 
+  on('tool.call', { tool: VOLUME_TOOL }, async ($, e) => {
+    const input = e as any
+    const v = input.volume
+    if (v !== undefined) {
+      if (!v || typeof v !== 'object' || typeof v.dataset !== 'string') return { deny: 'volume: {dataset: "file", path, shape?, dtype?, axes?} or a generator {dataset: "hydrogen" | "hydrogen_spherical" | "breathing" | "tight_binding" | "fermi", ...}' }
+      if (v.dataset === 'file') {
+        if (typeof v.path !== 'string' || !v.path.startsWith('/')) return { deny: `volume.path must be an absolute path (.npy, or raw .f32/.bin with shape): ${v.path}` }
+        if (!(await $.fs.exists(v.path))) return { deny: `no such file: ${v.path}` }
+      }
+    }
+    // a new `volume`: a new view (fields not given: the renderer's defaults); without, the fields given change the current one
+    const kind = galleryKind('volume.ts')
+    if (v === undefined && !KINDS[kind]?.ctl.volume) return { deny: 'no volume open yet: pass `volume`' }
+    const sv = KINDS[kind]?.ctl.sliderValues
+    if (v === undefined && input.slice !== undefined && sv) delete sv.slice // a slice given: over the slider's
+    return showView($, input, kind, VOLUME_KEYS, v !== undefined ? {} : undefined)
+  })
+
   on('tool.call', { tool: PLOT_TOOL }, async ($, e) =>
     showView($, e, 'pchip', ['function', 'n', 'x0', 'x1', 'ymin', 'ymax', 'showTrue', 'showSamples', 'compare']))
 
@@ -1125,6 +1150,7 @@ export const register: Register = (on, options) => {
                 anchor: { type: 'string', description: 'text: horizontal l|m|r then vertical t|m|b, e.g. "lm" (default "mm")' },
                 dx: { type: 'number', description: 'text: offset, CSS px' },
                 dy: { type: 'number' },
+                slice: { type: 'string', description: 'a numeric column: only the rows where it equals the slider of that name are drawn (a slider is added if not given; e.g. a heatmap over time)' },
               },
               required: ['type'],
             },
@@ -1195,7 +1221,7 @@ export const register: Register = (on, options) => {
           },
           legend: { type: 'boolean', description: 'default true (in the emptiest corner)' },
           endLabels: { type: 'boolean', description: 'each labelled line\'s name at its right end (last visible point), in the right margin; default: on with 5 or more labelled lines' },
-          sliders: { type: 'object', description: '{name: [min, max] | {min, max, step?, label?}}: in-frame sliders the user drags, each setting the fn param (expr params, or a named fn\'s order, lambda, tau, omega, zeta...) of that name in every series/mark; its value starts at the param\'s. state.sliders reports the values the user set' },
+          sliders: { type: 'object', description: '{name: [min, max] | {min, max, step?, label?}}: in-frame sliders the user drags, each setting the fn param (expr params, or a named fn\'s order, lambda, tau, omega, zeta...) of that name in every series/mark; its value starts at the param\'s. A mark `slice` column\'s slider: {label?, value?} or [min, max], snapping to the column\'s values. state.sliders reports the values the user set' },
           x0: { type: ['number', 'null'], description: 'visible x window start, data units; null: all data' },
           x1: { type: ['number', 'null'] },
           ymin: { type: ['number', 'null'], description: 'null: fit what is visible' },
@@ -1245,10 +1271,12 @@ export const register: Register = (on, options) => {
                 transform: { type: 'object', description: '{hull: true}: the 3D convex hull of the points as a mesh (≥ 4 non-coplanar points)' },
                 label: { type: 'string', description: 'legend entry of a mark without categorical fill' },
                 legend: { type: 'boolean' },
+                slice: { type: 'string', description: 'a numeric column: only the rows where it equals the slider of that name are drawn (mesh: faces wholly in the slice); a slider is added if not given' },
               },
               required: ['type'],
             },
           },
+          sliders: { type: 'object', description: '{column: {label?, value?} | [min, max]}: in-frame sliders over marks\' `slice` columns, snapping to their values' },
           xlabel: { type: 'string', description: 'default: the x column\'s name' },
           ylabel: { type: 'string' },
           zlabel: { type: 'string' },
@@ -1259,6 +1287,54 @@ export const register: Register = (on, options) => {
           axes: { type: 'boolean', description: 'false: no box, grid or ticks' },
           azimuth: { type: 'number', description: 'degrees (35)' },
           elevation: { type: 'number', description: 'degrees, -89..89 (25)' },
+          zoom: { type: 'number', description: 'relative to the auto-fit framing (1)' },
+        },
+      },
+      isDeferred: false,
+    })
+    await $.tool.register({
+      name: 'volume',
+      description:
+        'Show the user a live 3D volume of your own data inline in the chat, right here between your text (WebGPU ray marcher; they drag to orbit, ' +
+        'shift-drag/+/- to zoom, hover for the value, r resets). `volume: {dataset: "file", path}` reads a .npy (shape and dtype from its header) or raw ' +
+        'little-endian .f32/.bin (give shape); a 4D array [slices, z, y, x] gets an in-frame slider over its leading axis. NaN voxels are transparent ' +
+        '(also skipped by the colour domain and isosurfaces). Write the array to a file, don\'t inline it. A call with `volume` opens a new view ' +
+        '(fields not given: defaults); without, it changes only the fields given. Waits for the frame and returns the control, renderer state ' +
+        '(data domain, slice, isosurface triangles, hover) and a PNG snapshot path you can Read to see what the user sees.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          volume: {
+            type: 'object',
+            description: '{dataset: "file", path: absolute .npy | .f32 | .bin, shape?: [nz, ny, nx] | [ns, nz, ny, nx] (raw only; C order, x fastest), dtype?: "f32" | "f64" (raw, default f32), ' +
+              'axes?: [x, y, z, slice?] each {lo, hi, label?, unit?} (default: indices; one unit on x, y, z: box to scale), nan?: "transparent"}; ' +
+              'or a generator {dataset: "hydrogen", n, l, m} (also hydrogen_spherical, breathing, tight_binding, fermi)',
+          },
+          slice: { type: 'integer', description: 'index of the leading dimension shown (the user can drag the slider)' },
+          sliders: { type: ['object', 'boolean'], description: '{slice: {label?}}: the slice slider (default for 4D files; false: none)' },
+          title: { type: 'string' },
+          subtitle: { type: 'string' },
+          colormap: { type: 'string', description: 'viridis, inferno (default), magma, rdbu, twilight..., or "auto" (RdBu when the data cross `center`)' },
+          invertColormap: { type: 'boolean' },
+          scale: { type: 'string', enum: ['linear', 'log', 'symlog', 'sqrt', 'root'] },
+          rootN: { type: 'number', description: 'root scale: t^(1/n), 0.1..10 (3)' },
+          symlogThreshold: { type: 'number' },
+          domain: { type: ['array', 'null'], items: { type: ['number', 'null'] }, description: '[lo, hi] colour domain, either null: the data\'s (over every slice)' },
+          symmetric: { type: 'boolean', description: 'domain symmetric about `center` (0): diverging data' },
+          center: { type: 'number' },
+          mode: { type: 'string', enum: ['DVR', 'MIP', 'Iso'], description: 'DVR (default): emission-absorption; MIP: maximum; Iso: first crossing of threshold' },
+          opacity: { type: 'number', description: 'DVR opacity scale (0.25)' },
+          threshold: { type: 'number', description: 'normalised value (0..1) below which voxels are clear (0.1)' },
+          quality: { type: 'string', enum: ['low', 'medium', 'high'] },
+          isoLevels: { type: ['array', 'null'], items: { type: 'number' }, description: 'opaque isosurfaces (marching cubes) at these data values' },
+          isoColors: { type: 'string', enum: ['levels', 'colormap'] },
+          showVolume: { type: 'boolean', description: 'false: isosurfaces only' },
+          showBox: { type: 'boolean' },
+          showAxes: { type: 'boolean' },
+          valueLabel: { type: 'string', description: 'hover name of the value' },
+          up: { type: 'string', enum: ['y', 'z'], description: 'box axis drawn up (y)' },
+          azimuth: { type: 'number', description: 'degrees' },
+          elevation: { type: 'number', description: 'degrees, -89..89' },
           zoom: { type: 'number', description: 'relative to the auto-fit framing (1)' },
         },
       },
@@ -1365,16 +1441,16 @@ export const register: Register = (on, options) => {
   // A view's call row (`sciviz - chart (MCP)(title: ..., series: [...])`) is code in the middle of
   // the explanation: the figure stands alone between the text. ctrl+o (expanded) and errors show it.
   on('ui.render', { component: 'ToolUse' }, async ($, e, next) => {
-    const views = [VIEW_TOOL, PLOT_TOOL, OPEN_TOOL, CHART_TOOL, SCENE_TOOL]
+    const views = [VIEW_TOOL, PLOT_TOOL, OPEN_TOOL, CHART_TOOL, SCENE_TOOL, VOLUME_TOOL]
     if (!views.includes(e.props.tool) || e.props.isExpanded || e.props.isErrored || e.surface !== 'terminal') return next(e)
     const { Box } = $.ui.resolve(e)
     return <Box />
   })
 
   on('ui.render', { component: 'ToolResult' }, async ($, e, next) => {
-    if ([VIEW_TOOL, PLOT_TOOL, OPEN_TOOL, CHART_TOOL, SCENE_TOOL].includes(e.props.tool) && !e.props.isErrored && e.surface === 'terminal') {
+    if ([VIEW_TOOL, PLOT_TOOL, OPEN_TOOL, CHART_TOOL, SCENE_TOOL, VOLUME_TOOL].includes(e.props.tool) && !e.props.isErrored && e.surface === 'terminal') {
       // after a reload kindOf is empty: these rows are all frozen PNGs then, but they need their kind
-      let kind = kindOf[e.props.tool_use_id] ?? (e.props.tool === VIEW_TOOL ? 'surface' : e.props.tool === PLOT_TOOL ? 'pchip' : e.props.tool === CHART_TOOL ? galleryKind('line.ts') : e.props.tool === SCENE_TOOL ? galleryKind('scene.ts') : undefined)
+      let kind = kindOf[e.props.tool_use_id] ?? (e.props.tool === VIEW_TOOL ? 'surface' : e.props.tool === PLOT_TOOL ? 'pchip' : e.props.tool === CHART_TOOL ? galleryKind('line.ts') : e.props.tool === SCENE_TOOL ? galleryKind('scene.ts') : e.props.tool === VOLUME_TOOL ? galleryKind('volume.ts') : undefined)
       if (!kind && e.props.tool === OPEN_TOOL) {
         const out = e.props.output as any
         const id = (out?.entry ?? JSON.stringify(out).match(/\\?"entry\\?":\\?"([^"\\]+)/)?.[1]) as string | undefined

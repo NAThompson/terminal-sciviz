@@ -12,7 +12,7 @@
  */
 
 import { marchingCubes } from "../lib/marching_cubes.ts";
-import { axisValues, DEFAULTS, type VolumeMeta, VolumePlot, type VolumeSpec, volumeMeta } from "../volume.ts";
+import { axisValues, DEFAULTS, readStack, type VolumeMeta, VolumePlot, type VolumeSpec, volumeMeta } from "../volume.ts";
 import { renderOnce } from "../lib/serve.ts";
 
 const fact = (k: number) => { let f = 1; for (let i = 2; i <= k; i += 1) f *= i; return f; };
@@ -125,6 +125,7 @@ console.log("2. isosurfaces (GPU marching cubes vs CPU reference, same f32 voxel
 const cases: [string, VolumeSpec, number[] | null][] = [
   ["orbital_iso", { dataset: "hydrogen", n: 3, l: 2, m: 1, quantity: "psi" }, [-0.01, 0.01]],
   ["fermi_surface", { dataset: "fermi", size: 64 }, null],
+  ["file_slices (NaN outside the ball)", { dataset: "file", path: "assets/ball_modes.npy" }, [0.3]],
 ];
 for (const [name, spec, levels] of cases) {
   await renderOnce(plot, { ...DEFAULTS, volume: spec, isoLevels: levels, width: 64, height: 48 } as never);
@@ -139,4 +140,38 @@ for (const [name, spec, levels] of cases) {
     console.log(`  ${name} level ${stats[i].level}: triangles GPU ${stats[i].triangles}, CPU ${cpu.indices.length / 3} (diff ${stats[i].triangles - cpu.indices.length / 3}); area GPU ${ga.toFixed(3)}, CPU ${ca.toFixed(3)} (rel diff ${((ga - ca) / ca).toExponential(2)}); CPU vertices ${cpu.positions.length / 3} (welded); GPU ${stats[i].ms} ms, CPU ${cpuMs.toFixed(1)} ms`);
   }
 }
-Deno.exit(0);
+
+console.log("3. files: .npy headers, non-finite values, slice values, NaN validity");
+let bad = 0;
+const ok = (name: string, f: () => unknown) => {
+  let r: unknown;
+  try { r = f(); } catch (err) { r = `threw ${(err as Error).message}`; }
+  if (r !== true) bad += 1;
+  console.log(`  ${r === true ? "ok  " : "FAIL"} ${name}${r === true ? "" : `: ${r}`}`);
+};
+const dir = Deno.makeTempDirSync();
+const npy = (name: string, header: string, values: number[]) => {
+  const h = header + " ".repeat(63 - ((10 + header.length) % 64)) + "\n";
+  const b = new Uint8Array(10 + h.length + values.length * 4);
+  b.set([0x93, 78, 85, 77, 80, 89, 1, 0, h.length & 255, h.length >> 8]);
+  b.set(new TextEncoder().encode(h), 10);
+  new Float32Array(b.buffer, 10 + h.length).set(values);
+  Deno.writeFileSync(`${dir}/${name}`, b);
+  return { dataset: "file" as const, path: `${dir}/${name}` };
+};
+const eight = [1, 2, 3, 4, 5, 6, 7, 8];
+const throwsRe = (f: () => unknown, re: RegExp) => { try { f(); } catch (e) { return re.test((e as Error).message) || (e as Error).message; } return "did not throw"; };
+ok("double-quoted header", () => readStack(npy("dq.npy", `{"descr": "<f4", "fortran_order": False, "shape": (2, 2, 2)}`, eight)).data[7] === 8);
+ok("mixed quotes, fortran_order True rejected", () => throwsRe(() => readStack(npy("fq.npy", `{'descr': '<f4', "fortran_order": True, 'shape': (2, 2, 2), }`, eight)), /fortran_order/));
+ok("1-tuple shape (5,): not 3D", () => throwsRe(() => readStack(npy("one.npy", `{'descr': '<f4', 'fortran_order': False, 'shape': (5,), }`, [1, 2, 3, 4, 5])), /shape must be 3 or 4/));
+ok("a missing key", () => throwsRe(() => readStack(npy("mk.npy", `{'descr': '<f4', 'shape': (2, 2, 2), }`, eight)), /without descr, fortran_order and shape/));
+ok("±∞ rejected at its index", () => throwsRe(() => readStack(npy("inf.npy", `{'descr': '<f4', 'fortran_order': False, 'shape': (2, 2, 2), }`, [1, 2, 3, Infinity, 5, 6, 7, 8])), /flat index 3/));
+const big = npy("big.npy", `{'descr': '<f4', 'fortran_order': False, 'shape': (3, 2, 2, 2), }`, Array.from({ length: 24 }, (_, i) => i));
+await renderOnce(plot, { ...DEFAULTS, volume: { ...big, axes: [{ lo: 0, hi: 1 }, { lo: 0, hi: 1 }, { lo: 0, hi: 1 }, { lo: 1e12, hi: 1e12 + 2 }] }, slice: 2, width: 64, height: 48 } as never);
+ok("slice values at full precision (1e12 … 1e12 + 2): slice 2 shown", () => plot.volumeData!.values[0] === 16 || `first value ${plot.volumeData!.values[0]}`);
+// NaN validity: the CPU hover rule (≥ 1 − 1e-3 of the trilinear weight on valid voxels) on a NaN corner
+const half = npy("nan.npy", `{'descr': '<f4', 'fortran_order': False, 'shape': (2, 2, 2), }`, [NaN, 3e38, 3e38, 3e38, 3e38, 3e38, 3e38, 3e38]);
+const st = await renderOnce(plot, { ...DEFAULTS, volume: half, width: 64, height: 48 } as never);
+ok("NaN next to 3e38: domain over the valid voxels only", () => JSON.stringify((st.state as { dataDomain: number[] }).dataDomain) === JSON.stringify([Math.fround(3e38), Math.fround(3e38)]) || JSON.stringify((st.state as { dataDomain: number[] }).dataDomain));
+Deno.removeSync(dir, { recursive: true });
+Deno.exit(bad ? 1 : 0);

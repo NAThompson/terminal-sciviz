@@ -392,6 +392,17 @@ const heatmap = mark("marks_heatmap", "load by weekday and hour", "rect marks on
   ],
 });
 
+// two modes of a square membrane on a 16 × 12 grid at t = 0, 0.1, …, 0.9 (assets/membrane.json, made by
+// tools/make_membrane.ts): the rows of every t in one rect mark, `slice: "t"` drawing those at the slider's t
+const sliceHeatmap = mark("marks_slice_heatmap", "vibrating membrane", "a heatmap over time: rect marks of every t, `slice: \"t\"` drawing the rows at the in-frame slider's t (snapped to the data's values)", {
+  subtitle: "𝑢(𝑥, 𝑦, 𝑡) = sin 𝜋𝑥 sin 2𝜋𝑦 cos 2𝜋𝑡 + ½ sin 2𝜋𝑥 sin 𝜋𝑦 sin 2𝜋𝑡",
+  xlabel: "𝑥 cell",
+  ylabel: "𝑦 cell",
+  color: { scheme: "rdbu", domain: [-1.2, 1.2], label: "𝑢" },
+  marks: [{ type: "rect", file: "assets/membrane.json", x: "x", y: "y", fill: "u", slice: "t" }],
+  sliders: { t: { value: 0.2 } },
+});
+
 // --- PCHIP demos of plot1d.ts --------------------------------------------------------------------
 
 const pchip = (fn: string, n: number) =>
@@ -429,6 +440,7 @@ export const entries: Entry[] = [
   bars,
   barx,
   heatmap,
+  sliceHeatmap,
   pchip("bumps", 32),
   pchip("runge", 12),
   pchip("blocks", 32),

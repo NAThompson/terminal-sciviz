@@ -1,6 +1,6 @@
 ---
 name: terminal-sciviz
-description: How to present graphics to the user inside the terminal chat with the sciviz mod — static images (mcp__sciviz__show), live interactive WebGPU views (mcp__sciviz__chart, mcp__sciviz__scene, mcp__sciviz__gallery_open, mcp__sciviz__view, mcp__sciviz__plot), and how to make plots that look right there. Use whenever a picture, plot, comparison, 3D view or interactive exploration would help the user, before writing any plotting code, and whenever you're tempted to describe something visual in words.
+description: How to present graphics to the user inside the terminal chat with the sciviz mod — static images (mcp__sciviz__show), live interactive WebGPU views (mcp__sciviz__chart, mcp__sciviz__scene, mcp__sciviz__volume, mcp__sciviz__gallery_open, mcp__sciviz__view, mcp__sciviz__plot), and how to make plots that look right there. Use whenever a picture, plot, comparison, 3D view or interactive exploration would help the user, before writing any plotting code, and whenever you're tempted to describe something visual in words.
 ---
 
 # Presenting graphics in the terminal
@@ -17,6 +17,7 @@ has a visible effect, render the alternatives side by side and show them before 
 | A PNG you made (matplotlib, a renderer, a screenshot) | `mcp__sciviz__show` with the absolute `path` (and a one-line `caption`) |
 | A live chart of **your own** data or functions (scatter/bubble, lines, bars, areas, histograms, heatmaps, distributions, fits) | `mcp__sciviz__chart` with `marks`: each a type (`line`, `dot`, `bar`, `barX`, `area`, `rect`, `rule`, `text`, `interval`, `box`) over `data` columns (or a CSV/JSON `file` with a header, or a function `fn`), channels naming columns (`x`, `y`, `fill`, `r`, `z`, ...) and `transform`s (below). A later call without `marks`/`series` adjusts the same chart (window, title, scales). `series` is the older one-line-per-entry shorthand |
 | A live 3D scene of **your own** data: 3D scatter, point clouds, 3D polylines, triangle meshes, convex hulls | `mcp__sciviz__scene` with `marks` (`dot`, `line`, `mesh`) over `data` columns or a `file`, channels `x`, `y`, `z`, `fill`, `r` like `chart` (below) |
+| A live 3D volume of **your own** array (a 3D field, or a 4D stack over time / a parameter) | `mcp__sciviz__volume` with `volume: {dataset: "file", path}`: a `.npy` (or raw little-endian `.f32` with `shape`), `axes` [x, y, z, slice?] `{lo, hi, label, unit}`; NaN = transparent; a 4D array gets a slice slider. Colour/opacity/iso fields like the volume gallery entries |
 | An interactive view of a gallery entry (lines, curves, complex, volumes, scenes...) | `mcp__sciviz__gallery_open` with its `id` (fuzzy names work: `blocks`, `lorenz`); `control` overrides fields (window `x0`/`x1`, camera `azimuth`/`elevation`/`zoom`, `colormap`) |
 | A live 3D surface: built-in (`torus`, `sphere`, `wave`, `dini`, `breather`, `teapot`) or **your own** | `mcp__sciviz__view` with `surface`, or with `nurbs` (one patch or an array of patches; see below) |
 | A live PCHIP interpolation plot | `mcp__sciviz__plot` |
@@ -72,6 +73,10 @@ or a named fn's `order`/`lambda`/`tau`/`omega`/`zeta`, in every series and mark)
 `gallery_open` control (curve ODEs: `curves/lorenz` with `{sliders: {rho: [0, 50]}}`, also `sigma`,
 `beta`). They're drawn in the frame; dragging re-renders live. `state.sliders` reports the values the
 user set (call `chart` again without `marks` to read them); unknown names come back as an error.
+**Sliders over data**: give a `chart` or `scene` mark `slice: "t"` (a numeric column) and only the
+rows at the `t` slider's value are drawn, snapping to the column's values (a slider is added; set
+`sliders: {t: {label, value}}` to name or start it). Put every time step in one mark: a heatmap over
+time is `{type: "rect", data, x, y, fill: "u", slice: "t"}`. Volumes slice their leading axis the same way.
 
 **Charts are combinations of marks, channels and transforms**, not special options. Strings in
 `x`/`y` become categories; a string `fill` colours by category (Okabe–Ito palette legend, at most 7; it also

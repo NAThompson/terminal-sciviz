@@ -16,7 +16,9 @@
  * three back panes of the data's box with grid lines, tick labels on the edges facing the camera
  * (as matplotlib's 3D axes), equal aspect unless `aspect: "auto"` (each axis normalised) or
  * [ax, ay, az]. Hover: the nearest point under the pointer (the frontmost one it covers) and its
- * row. Orbit camera, held framing while `interacting`, as curve.ts.
+ * row. Orbit camera, held framing while `interacting`, as curve.ts. `slice: "<column>"` on a mark
+ * draws only the rows where that column equals the slider of the same name (lib/sliders.ts; one is
+ * added if not given): the marks are resolved once, a drag re-uploads only the rows of the value.
  *
  *   deno run -A scene.ts png CONTROL.json -o out.png
  *   deno run -A scene.ts serve CONTROL.json OUTDIR [--ignore-stdin] [--spin 0.5] [--inflight 3]
@@ -34,6 +36,7 @@ import { type Columns, sqrtRadius } from "./lib/marks.ts";
 import { INK, INK2, PALETTE, tableFile } from "./line.ts";
 import { convexHull } from "./lib/hull.ts";
 import { normalRng } from "./lib/specfun.ts";
+import { drawSliders, resolveSliders, type Slider, type SliderDef, sliderHeight } from "./lib/sliders.ts";
 
 const GRID = "#262c36", EDGE = "#30363d", HOVER_RING = "#e6edf3";
 const LABEL_FILL: Rgba = [20 / 255 * (240 / 255), 24 / 255 * (240 / 255), 30 / 255 * (240 / 255), 240 / 255];
@@ -67,6 +70,7 @@ export interface SceneMark {
   transform?: { hull?: boolean };
   label?: string;
   legend?: boolean;
+  slice?: string; // a numeric column: only the rows at the slider of that name's value are drawn
 }
 
 export const DEFAULTS = {
@@ -86,7 +90,9 @@ export const DEFAULTS = {
   azimuth: 35,
   elevation: 25,
   zoom: 1,
-  interacting: false, // while the mod orbits: the framing held
+  sliders: null as Record<string, unknown> | null, // of the marks' slice columns (lib/sliders.ts)
+  sliderValues: null as Record<string, number> | null, // set by dragging them
+  interacting: false, // while the mod orbits or drags a slider: the framing held
   hover: null as [number, number] | null,
   snapshot: null as { path: string; rev: number } | string | null,
   frameFile: false,
@@ -348,6 +354,7 @@ interface Built {
   width: number;
   groups?: number[][]; // line: rows of each polyline, in order
   groupKeys?: Value[];
+  slice?: { name: string; at: Float64Array }; // the slice column's value per row
 }
 
 function channel(m: SceneMark, k: "x" | "y" | "z", cols: Columns, n: number, where: string): Float64Array {
@@ -384,6 +391,11 @@ function resolveMark(m: SceneMark, index: number): Built {
     b.constColor = hexColor(fill) ?? undefined;
     if (!b.constColor) throw new Error(`${where}: fill "${fill}" is neither a column nor a #rrggbb colour`);
   } else if (fill !== undefined) throw new Error(`${where}: fill must be a column name or a #rrggbb colour`);
+  if (m.slice !== undefined) {
+    if (typeof m.slice !== "string" || !Object.hasOwn(cols, m.slice)) throw new Error(`${where}: slice: "${m.slice}" is not a column (columns: ${Object.keys(cols).join(", ") || "none"})`);
+    if (cols[m.slice].some((v) => typeof v === "string")) throw new Error(`${where}: slice column "${m.slice}" must be numeric`);
+    b.slice = { name: m.slice, at: Float64Array.from(cols[m.slice], num) };
+  }
   if (m.edges) {
     b.edges = typeof m.edges === "string" ? hexColor(m.edges) : hexColor(EDGE_DEFAULT);
     if (!b.edges) throw new Error(`${where}: edges must be true or a #rrggbb colour`);
@@ -391,14 +403,21 @@ function resolveMark(m: SceneMark, index: number): Built {
   if (m.transform?.hull) {
     if (m.type === "line") throw new Error(`${where}: hull applies to dot or mesh marks`);
     const finite = Array.from({ length: n }, (_, i) => i).filter((i) => Number.isFinite(pos[3 * i]) && Number.isFinite(pos[3 * i + 1]) && Number.isFinite(pos[3 * i + 2]));
-    let hull: ReturnType<typeof convexHull>;
-    try {
-      hull = convexHull(finite.flatMap((i) => [pos[3 * i], pos[3 * i + 1], pos[3 * i + 2]]));
-    } catch (err) {
-      throw new Error(`${where}: ${(err as Error).message}`);
+    // one hull per slice value (all computed here, once per data): a slice draws the faces of its rows
+    const parts = new Map<number, number[]>();
+    for (const i of finite) {
+      const k = b.slice ? b.slice.at[i] : 0;
+      (parts.get(k) ?? parts.set(k, []).get(k)!).push(i);
+    }
+    b.faces = [];
+    for (const [k, rows] of parts) {
+      try {
+        b.faces.push(...convexHull(rows.flatMap((i) => [pos[3 * i], pos[3 * i + 1], pos[3 * i + 2]])).faces.map((f) => f.map((j) => rows[j])));
+      } catch (err) {
+        throw new Error(`${where}: ${b.slice ? `${b.slice.name} = ${k}: ` : ""}${(err as Error).message}`);
+      }
     }
     b.type = "mesh";
-    b.faces = hull.faces.map((f) => f.map((k) => finite[k]));
     if (m.opacity === undefined) b.opacity = 0.35;
   } else if (m.transform && Object.keys(m.transform).length) {
     throw new Error(`${where}: unknown transform ${Object.keys(m.transform).join(", ")} (known: hull)`);
@@ -470,6 +489,11 @@ export class ScenePlot implements ServeRenderer<Control> {
   private cats: Value[] = [];
   private bar?: ColorBar;
   private heldFit?: [Vec3, number];
+  private slices: Record<string, number[]> = {}; // distinct sorted values of each slice column
+  private sel: Record<string, number> = {}; // the sliders' values
+  private uploadKey?: string;
+  private sliderDefs: SliderDef[] = [];
+  private sliders: Slider[] = []; // as drawn
   private vp: number[] = [];
   private viewM: number[] = []; // world to view
   private proj: number[] = [];
@@ -545,10 +569,31 @@ export class ScenePlot implements ServeRenderer<Control> {
     else if (a !== "equal" && a !== undefined && a !== null) throw new Error(`aspect must be "equal", "auto" or [ax, ay, az]`);
     const box: Box = { lo, hi, centre: [0, 1, 2].map((k) => (lo[k] + hi[k]) / 2) as Vec3, scale };
     const { cats, bar } = this.colorize(built, ctl);
-    const gpu = this.upload(built, box);
-    // swap
+    const slices: Record<string, number[]> = Object.create(null);
+    for (const b of built) {
+      if (b.slice) slices[b.slice.name] = [...new Set([...(slices[b.slice.name] ?? []), ...b.slice.at])].filter(Number.isFinite).sort((p, q) => p - q);
+    }
+    // swap (uploaded by `select`)
     this.disposeData();
-    Object.assign(this, { built, box, cats, bar, gpu, dataKey: key });
+    Object.assign(this, { built, box, cats, bar, slices, dataKey: key, uploadKey: undefined });
+  }
+
+  /** The sliders of the slice columns (given, or added), and the GPU buffers of their rows. */
+  private select(ctl: Control): void {
+    const given = (ctl.sliders ?? {}) as Record<string, unknown>;
+    const specs = { ...Object.fromEntries(Object.keys(this.slices).map((k) => [k, {}])), ...given };
+    this.sliderDefs = resolveSliders(specs, ctl.sliderValues, [], this.slices);
+    this.sel = Object.fromEntries(this.sliderDefs.map((d) => [d.name, d.value]));
+    const key = JSON.stringify(this.sel);
+    if (this.gpu && key === this.uploadKey) return;
+    const gpu = this.upload(this.built, this.box);
+    this.disposeData();
+    Object.assign(this, { gpu, uploadKey: key });
+  }
+
+  /** Whether row `i` of `b` is drawn: in no slice, or in the slider's. */
+  private on(b: Built, i: number): boolean {
+    return !b.slice || b.slice.at[i] === this.sel[b.slice.name];
   }
 
   /** Colours of every row: categorical (shared palette order), numeric (one colour map and bar), constant, default. */
@@ -620,13 +665,14 @@ export class ScenePlot implements ServeRenderer<Control> {
       if (b.type === "dot") {
         for (let i = 0; i < n; i += 1) {
           const p = W(i);
-          if (!ok(p) || !(b.radius![i] > 0) || !(b.color[4 * i + 3] > 0)) continue;
+          if (!this.on(b, i) || !ok(p) || !(b.radius![i] > 0) || !(b.color[4 * i + 3] > 0)) continue;
           const col = [b.color[4 * i], b.color[4 * i + 1], b.color[4 * i + 2], b.color[4 * i + 3]];
           if (b.opacity < 1) tDots.push(...p, b.radius![i], ...col);
           else dotPos.push(...p, b.radius![i]), dotCol.push(...col);
         }
       } else if (b.type === "line") {
-        for (const g of b.groups!) {
+        for (const all of b.groups!) {
+          const g = b.slice ? all.filter((i) => this.on(b, i)) : all; // the slice's rows, joined in order
           for (let j = 0; j + 1 < g.length; j += 1) {
             const [p, q] = [W(g[j]), W(g[j + 1])];
             if (ok(p) && ok(q)) seg(p, q, b.color.subarray(4 * g[j]), b.color.subarray(4 * g[j + 1]), b.width, 0);
@@ -641,7 +687,7 @@ export class ScenePlot implements ServeRenderer<Control> {
           const u = [q[0] - p[0], q[1] - p[1], q[2] - p[2]], v = [r[0] - p[0], r[1] - p[1], r[2] - p[2]];
           return [u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0]];
         };
-        const faces = b.faces!.filter((f) => f.every((i) => ok(W(i)))); // drawable: finite corners
+        const faces = b.faces!.filter((f) => f.every((i) => this.on(b, i) && ok(W(i)))); // drawable: finite corners in the slice
         if (!b.flat) for (const f of faces) { const fn = faceN(f); for (const i of f) for (let c = 0; c < 3; c += 1) normals[3 * i + c] += fn[c]; }
         const edges = new Set<string>();
         for (const f of faces) {
@@ -712,7 +758,8 @@ export class ScenePlot implements ServeRenderer<Control> {
     const legend = this.legendRows(ctl);
     const legendW = legend.length ? Math.max(...legend.map(([t]) => this.font.measure(F.label, t))) + Math.round(34 * s) : 0;
     const right = Math.max(this.bar ? Math.round(110 * s) : 0, legendW ? legendW + Math.round(16 * s) : 0);
-    const [L, T, R, B] = [Math.round(56 * s), Math.round(64 * s), w - Math.round(56 * s) - right, h - Math.round(44 * s)];
+    const row = this.sliderDefs.length ? sliderHeight(F.label, s) + Math.round(14 * s) : 0; // sliders: a row under the title
+    const [L, T, R, B] = [Math.round(56 * s), Math.round(64 * s) + row, w - Math.round(56 * s) - right, h - Math.round(44 * s)];
     this.plot = [L, T, R, B];
     const [pw, ph] = [Math.max(R - L, 16), Math.max(B - T, 16)];
     const { lo, hi, centre, scale } = this.box;
@@ -816,6 +863,7 @@ export class ScenePlot implements ServeRenderer<Control> {
     const ty = Math.round(28 * s);
     const tw = ctl.title ? q.text(ctl.title, Math.round(16 * s), ty, F.title, premul(INK), "lm") : 0;
     if (ctl.subtitle) q.text(ctl.subtitle, Math.round(16 * s) + tw + (tw ? Math.round(16 * s) : 0), ty, F.sub, premul(INK2), "lm");
+    this.sliders = drawSliders(q, F.label, this.sliderDefs, Math.round(16 * s), Math.round(48 * s), Math.round(160 * s), Math.round(32 * s), s, false, ctl.sliderHot);
     let top = T;
     if (legend.length) {
       const x = w - Math.round(16 * s) - legendW;
@@ -880,6 +928,7 @@ export class ScenePlot implements ServeRenderer<Control> {
       const { centre: c, scale: k } = this.box;
       for (let j = 0; j < n; j += 1) {
         const i = b.vertices ? b.vertices[j] : j;
+        if (!this.on(b, i)) continue;
         const X = (b.pos[3 * i] - c[0]) * k[0], Y = (b.pos[3 * i + 1] - c[1]) * k[1], Z = (b.pos[3 * i + 2] - c[2]) * k[2];
         if (!(b.color[4 * i + 3] > 0) || (b.radius && !(b.radius[i] > 0))) continue; // not drawn
         const cw = e[3] * X + e[7] * Y + e[11] * Z + e[15];
@@ -1052,6 +1101,7 @@ export class ScenePlot implements ServeRenderer<Control> {
   async submit(ctl: Control, slot: number): Promise<Pending> {
     const { device } = this;
     this.setData(ctl);
+    this.select(ctl);
     const w = Math.trunc(ctl.width);
     const h = Math.trunc(ctl.height);
     const s = Math.min(Math.max(Math.min(w / 1200, h / 750), 0.6), 2.5);
@@ -1093,7 +1143,7 @@ export class ScenePlot implements ServeRenderer<Control> {
     return {
       generation, width: this.size[0], height: this.size[1], hover, renderMs: Math.round(ms * 1000) / 1000,
       azimuth: ctl.azimuth, elevation: ctl.elevation, distance: this.distance, target: this.target,
-      plotRect: this.plot, content: this.content, marks: counts,
+      plotRect: this.plot, content: this.content, marks: counts, ...(this.sliders.length ? { sliders: this.sliders } : {}),
       box: { lo: this.box.lo, hi: this.box.hi }, ...(this.bar ? { colorDomain: this.bar.domain } : {}), ...(this.cats.length ? { categories: this.cats } : {}),
     };
   }

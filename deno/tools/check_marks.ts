@@ -11,6 +11,8 @@ import { compileMarks, type Mark } from "../lib/marks.ts";
 import { compileExpr } from "../lib/expr.ts";
 import { resolveFn } from "../lib/generators.ts";
 import { type Control, DEFAULTS, INK, LinePlot, PALETTE, parseDelimited } from "../line.ts";
+import { type Control as SceneControl, DEFAULTS as SCENE_DEFAULTS, ScenePlot } from "../scene.ts";
+import { resolveSliders } from "../lib/sliders.ts";
 
 let bad = 0;
 function check(name: string, f: () => unknown): void {
@@ -138,6 +140,65 @@ const frame = async (over: Partial<Control>) => {
     (errs.length === 2 && errs[0] === errs[1] && p.colorbar === bar && p.marked === marked) || `errors ${errs.length}, same ${errs[0] === errs[1]}`);
   await frame({ series: [], marks: good });
   check("then a good compile again", () => p.colorbar !== undefined);
+}
+
+// 11: slices: a mark's rows split by a column before its transforms, every slice compiled once
+{
+  const data = { x: [1, 2, 3, 1, 2, 3, 1], t: [0, 0, 0, 0.5, 0.5, 0.5, 1], v: [1, 2, 3, 10, 20, 30, 5] };
+  const c = compile([{ type: "dot", data, x: "x", y: "v", fill: "v", slice: "t" }, { type: "line", data: { x: [0, 3], y: [0, 0] }, x: "x", y: "y" }]);
+  check("slice: one series per value, tagged, the rest untagged", () =>
+    JSON.stringify(c.series.map((s) => s.slice?.value ?? null)) === "[0,0.5,1,null]" && JSON.stringify(c.slices) === '{"t":[0,0.5,1]}' || JSON.stringify(c.series.map((s) => s.slice)));
+  check("slice: the colour domain over every slice", () => JSON.stringify(c.colorbar!.domain) === "[1,30]" || JSON.stringify(c.colorbar!.domain));
+  check("slice: rows of the value, its row in the hover", () => c.series[1].y!.join() === "10,20,30" && c.series[1].tips![0].at(-1)!.join() === "t,0.5");
+  const binned = compile([{ type: "bar", data, x: "x", transform: { bin: { thresholds: 3 } }, slice: "t" }]);
+  check("slice: transforms per slice (bin counts)", () => binned.series.map((s) => s.y!.reduce((a, b) => a + b, 0)).join() === "3,3,1" || binned.series.map((s) => s.y).join("|"));
+  check("slice: not a column", () => throws(() => compile([{ type: "dot", data, x: "x", y: "v", slice: "time" }]), /slice: "time" is not a column/));
+  check("slice: categorical column", () => throws(() => compile([{ type: "dot", data: { x: [1], y: [1], g: ["a"] }, x: "x", y: "y", slice: "g" }]), /must be numeric/));
+  const [d] = resolveSliders({ t: {} }, { t: 0.7 }, [], { t: [0, 0.5, 1] });
+  check("slice slider: snaps to the nearest value, the values reported", () => (d.value === 0.5 && d.min === 0 && d.max === 1 && d.values!.length === 3) || JSON.stringify(d));
+  check("slice slider: [min, max] keeps the values within", () => resolveSliders({ t: [0.2, 1] }, null, [], { t: [0, 0.5, 1] })[0].values!.join() === "0.5,1");
+  check("slider of no parameter or slice", () => throws(() => resolveSliders({ q: [0, 1] }, null, [], { t: [0] }), /no parameter "q".*slice columns: t/));
+}
+{
+  const data = { x: [0, 1, 2, 0, 1, 2], y: [0, 1, 0, 5, 9, 5], t: [0, 0, 0, 1, 1, 1] };
+  const marks: Mark[] = [{ type: "line", data, x: "x", y: "y", slice: "t" }];
+  const s0 = await frame({ series: [], marks }) as { ymax: number; sliders?: { name: string; value: number; values: number[] }[] };
+  check("chart: a slider added for the slice column, at its first value", () => (s0.sliders?.[0]?.name === "t" && s0.sliders[0].value === 0 && s0.ymax < 2) || JSON.stringify(s0));
+  const held = await frame({ series: [], marks, sliderValues: { t: 1 }, interacting: true });
+  check("chart: dragging (interacting) holds the y range", () => held.ymax === s0.ymax || `ymax ${held.ymax}`);
+  const t0 = performance.now();
+  for (let k = 0; k < 20; k += 1) await frame({ series: [], marks, sliderValues: { t: k % 2 }, interacting: true });
+  console.log(`     chart slice switch (frame, 400×300): ${((performance.now() - t0) / 20).toFixed(1)} ms`);
+  const released = await frame({ series: [], marks, sliderValues: { t: 1 } });
+  check("chart: released, refitted to the slice", () => released.ymax > 9 || `ymax ${released.ymax}`);
+}
+{
+  const scene = await ScenePlot.create();
+  const sframe = async (over: Partial<SceneControl>) => {
+    const ctl = { ...structuredClone(SCENE_DEFAULTS), width: 400, height: 300, ...over } as SceneControl;
+    const p = await scene.submit(ctl, 0);
+    await p.done;
+    p.read((n) => new Uint8Array(n));
+    return scene as unknown as { gpu: { dots: { count: number }; mesh: { count: number }; segs: { count: number } }; state: ScenePlot["state"] };
+  };
+  const data = { x: [0, 1, 0, 0, 1, 0, 9], y: [0, 0, 1, 0, 0, 1, 9], z: [0, 0, 0, 1, 1, 1, 9], t: [0, 0, 0, 1, 1, 1, 2] };
+  const marks = [
+    { type: "dot", data, slice: "t" },
+    { type: "mesh", data, faces: [[0, 1, 2], [3, 4, 5], [2, 3, 4]], slice: "t" },
+    { type: "line", data, slice: "t" },
+    { type: "dot", data: { x: [5], y: [5], z: [5] } },
+  ] as SceneControl["marks"];
+  const g = await sframe({ marks, sliderValues: { t: 1 } });
+  check("scene: dots, mesh faces, line segments of the slice (faces across slices dropped)", () =>
+    (g.gpu.dots.count === 4 && g.gpu.mesh.count === 3 && g.gpu.segs.count === 2) || JSON.stringify([g.gpu.dots.count, g.gpu.mesh.count, g.gpu.segs.count]));
+  const st = g.state({ ...SCENE_DEFAULTS, marks } as SceneControl, 0, null, 0) as { sliders: { name: string; value: number }[]; box: { hi: number[] } };
+  check("scene: the slider, the box over every slice", () => (st.sliders[0].name === "t" && st.sliders[0].value === 1 && st.box.hi[0] > 9) || JSON.stringify(st));
+  const alt = await sframe({ marks: [{ type: "line", data: { x: [0, 1, 2, 3], y: [0, 0, 0, 0], z: [0, 1, 0, 1], t: [0, 1, 0, 1] }, slice: "t" }] as SceneControl["marks"], sliderValues: { t: 1 } });
+  check("scene: a line of alternating slices joins the slice's rows", () => alt.gpu.segs.count === 1 || `segments ${alt.gpu.segs.count}`);
+  const cube = (o: number) => [0, 1, 2, 3, 4, 5, 6, 7].map((c) => [o + (c & 1), (c >> 1) & 1, (c >> 2) & 1]);
+  const pts = [...cube(0), ...cube(10)];
+  const hulls = await sframe({ marks: [{ type: "dot", data: { x: pts.map((p) => p[0]), y: pts.map((p) => p[1]), z: pts.map((p) => p[2]), t: pts.map((_, i) => (i < 8 ? 0 : 1)) }, transform: { hull: true }, slice: "t" }] as SceneControl["marks"], sliderValues: { t: 1 } });
+  check("scene: a hull per slice (a cube's 12 triangles, not the hull of both)", () => hulls.gpu.mesh.count === 0 && (hulls as unknown as { gpu: { blend: { tris: Float32Array } } }).gpu.blend.tris.length / 36 === 12 || `opaque ${hulls.gpu.mesh.count}, translucent ${(hulls as unknown as { gpu: { blend: { tris: Float32Array } } }).gpu.blend.tris.length / 36}`);
 }
 
 console.log(bad ? `${bad} failed` : "all passed");

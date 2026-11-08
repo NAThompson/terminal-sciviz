@@ -121,8 +121,9 @@ export const DEFAULTS = {
   x1: null as number | null,
   ymin: null as number | null, // null: fit what is visible, 8% margin (in axis space)
   ymax: null as number | null,
-  sliders: null as Record<string, unknown> | null, // {name: [min, max] | {min, max, step?, label?}}: of fn params (lib/sliders.ts)
+  sliders: null as Record<string, unknown> | null, // {name: [min, max] | {min, max, step?, label?}}: of fn params, or a marks' slice column (lib/sliders.ts)
   sliderValues: null as Record<string, number> | null, // set by dragging them
+  interacting: false, // while the mod drags a slider: the x extent and y range held
   hover: null as [number, number] | null,
   snapshot: null as { path: string; rev: number } | string | null,
   frameFile: false,
@@ -130,9 +131,14 @@ export const DEFAULTS = {
 };
 export type Control = typeof DEFAULTS & Record<string, unknown>;
 
-/** The control with its sliders' values in the fn params they name (series and marks copied). */
+/** The marks' slice columns (each has a slider: given, or added). */
+const sliceNames = (ctl: Control) => [...new Set((Array.isArray(ctl.marks) ? ctl.marks : []).flatMap((m) => (typeof m?.slice === "string" ? [m.slice] : [])))];
+
+/** The control with its sliders' values in the fn params they name (series and marks copied);
+ * sliders of slice columns are left to `withMarks`. */
 function withSliders(ctl: Control): { ctl: Control; defs: SliderDef[] } {
   if (!ctl.sliders) return { ctl, defs: [] };
+  const slices = sliceNames(ctl);
   const series = structuredClone(ctl.series), marks = structuredClone(Array.isArray(ctl.marks) ? ctl.marks : []);
   for (const sp of series) { // generator names alone: as {name}, their args settable
     if (sp.fn) sp.fn = fnObject(sp.fn) as FnSpec;
@@ -144,7 +150,8 @@ function withSliders(ctl: Control): { ctl: Control; defs: SliderDef[] } {
     ...series.flatMap((sp) => [sp.fn, sp.sample?.fn, sp.fill?.lo, sp.fill?.hi].flatMap(fnParams)),
     ...marks.flatMap((m) => fnParams(m?.fn)),
   ];
-  const defs = resolveSliders(ctl.sliders, ctl.sliderValues, params);
+  const own = Object.entries(ctl.sliders).filter(([k]) => !slices.includes(k));
+  const defs = resolveSliders(Object.fromEntries(own), ctl.sliderValues, params);
   return { ctl: { ...ctl, series, marks }, defs };
 }
 
@@ -454,7 +461,9 @@ function expandStat(spec: SeriesSpec, color: string, boxIndex: number, many: boo
   throw new Error(`stat must be one of ecdf, qq, box, hist, linreg (or {type, ...options})`);
 }
 
-const fileMtime = (path: string) => { try { return Deno.statSync(path).mtime?.getTime() ?? 0; } catch { return -1; } };
+/** A data file's path: relative ones (the gallery's assets; the tools require absolute paths) against deno/. */
+const dataPath = (path: string) => (path.startsWith("/") ? path : new URL(path, import.meta.url).pathname);
+const fileMtime = (path: string) => { try { return Deno.statSync(dataPath(path)).mtime?.getTime() ?? 0; } catch { return -1; } };
 const fileCache = new Map<string, { mtime: number; value: unknown }>();
 
 /** `parse` of a data file's text, once per path and mtime (`what`: "series", "mark", for errors). */
@@ -463,7 +472,7 @@ function cachedFile<T>(what: string, path: string, parse: (text: string) => T): 
   const hit = fileCache.get(key);
   if (hit && hit.mtime === mtime) return hit.value as T;
   let text: string;
-  try { text = Deno.readTextFileSync(path); } catch (err) { throw new Error(`${what} file ${path}: ${(err as Error).message}`); }
+  try { text = Deno.readTextFileSync(dataPath(path)); } catch (err) { throw new Error(`${what} file ${path}: ${(err as Error).message}`); }
   const value = parse(text);
   if (fileCache.size > 64) fileCache.clear();
   fileCache.set(key, { mtime, value });
@@ -745,6 +754,9 @@ export class LinePlot implements ServeRenderer<Control> {
   private colorbar?: ColorBar;
   private sliderDefs: SliderDef[] = [];
   private sliders: Slider[] = []; // as drawn
+  private picked: Compiled[] = []; // the marks' series drawn: those of no slice, or of the sliders' values
+  private dataExtent: [number, number] = [0, 1];
+  private held?: { extent: [number, number]; y?: [number, number] }; // while `interacting`
 
   constructor(private readonly device: GPUDevice, private readonly font: BitmapFont) {
     this.overlay = new OverlayRenderer(device, font);
@@ -766,7 +778,7 @@ export class LinePlot implements ServeRenderer<Control> {
    * leaves the last good plot as it was). */
   setData(ctl: Control, marksKey = ""): void {
     // the control's own series (marks: by their key, not their compiled series), a rewritten file: new data
-    const own = ctl.series.slice(0, ctl.series.length - (marksKey ? this.marked!.series.length : 0));
+    const own = ctl.series.slice(0, ctl.series.length - (marksKey ? this.picked.length : 0));
     const key = JSON.stringify([own, ctl.x, ctl.y, own.map((sp) => (sp.file ? fileMtime(sp.file) : 0))]) + marksKey;
     if (key === this.dataKey) {
       return;
@@ -816,7 +828,7 @@ export class LinePlot implements ServeRenderer<Control> {
     this.dense.clear();
     this.series = series;
     this.curves = curves;
-    this.extent = lo < hi ? [lo, hi] : lo === hi ? [lo - 0.5, lo + 0.5] : [0, 1];
+    this.dataExtent = lo < hi ? [lo, hi] : lo === hi ? [lo - 0.5, lo + 0.5] : [0, 1];
     this.dataKey = key;
     this.dataGen += 1;
     this.geomKey = this.chromeKey = undefined;
@@ -889,7 +901,7 @@ export class LinePlot implements ServeRenderer<Control> {
       throw new Error("x1 must be above x0");
     }
     // Geometry: the view and the curve layer; chrome: grid, text, references, legend
-    const geomKey = JSON.stringify([this.dataGen, w, h, x0, x1, ctl.ymin, ctl.ymax, ctl.overlays, Boolean(ctl.ylabel), Boolean(ctl.xlabel), this.sliderDefs.length, ctl.endLabels]);
+    const geomKey = JSON.stringify([this.dataGen, w, h, x0, x1, ctl.ymin, ctl.ymax, ctl.overlays, Boolean(ctl.ylabel), Boolean(ctl.xlabel), this.sliderDefs.length, ctl.endLabels, Boolean(ctl.interacting)]);
     const chromeKey = JSON.stringify([geomKey, ctl.legend, ctl.title, ctl.subtitle, ctl.xlabel, ctl.ylabel, ctl.zeroLine, ctl.nanColor, this.sliderDefs, ctl.sliderHot]);
     if (geomKey !== this.geomKey) {
       this.setGeometry(ctl, w, h, x0, x1, tx, ty);
@@ -983,6 +995,7 @@ export class LinePlot implements ServeRenderer<Control> {
     if (!(y1 > y0)) [y0, y1] = [y0 - 0.5, y0 + 0.5];
     const ycats = ctl.y.categories?.length;
     if (ycats && ctl.ymin === null && ctl.ymax === null) [y0, y1] = [-0.5, ycats - 0.5]; // whole slots
+    if (ctl.interacting && this.held?.y) [y0, y1] = this.held.y; // dragging a slider: the y range held, refitted on release
 
     // Ticks, then the left margin from the widest label
     const yticks = axisTicks(ctl.y, ty.inv(y0), ty.inv(y1), (B - T) / s);
@@ -1651,7 +1664,16 @@ export class LinePlot implements ServeRenderer<Control> {
     if (this.marksError) throw this.marksError; // the frame is refused: the last good one (and its colour bar) stands
     const c = this.marked!;
     this.colorbar = c.colorbar;
-    return { ...ctl, series: [...ctl.series, ...c.series], x: c.x, y: c.y };
+    // slices: the series of each slider's value (the compile holds every slice's: a drag only picks)
+    const names = sliceNames(ctl);
+    if (names.length) {
+      const given = (ctl.sliders ?? {}) as Record<string, unknown>;
+      const defs = resolveSliders(Object.fromEntries(names.map((k) => [k, given[k] ?? {}])), ctl.sliderValues, [], c.slices);
+      this.sliderDefs = [...this.sliderDefs, ...defs];
+      const at = new Map(defs.map((d) => [d.name, d.value]));
+      this.picked = c.series.filter((sr) => !sr.slice || sr.slice.value === at.get(sr.slice.name));
+    } else this.picked = c.series;
+    return { ...ctl, series: [...ctl.series, ...this.picked], x: c.x, y: c.y };
   }
 
   async submit(ctl: Control, slot: number): Promise<Pending> {
@@ -1660,10 +1682,13 @@ export class LinePlot implements ServeRenderer<Control> {
     ({ ctl, defs } = withSliders(ctl));
     this.sliderDefs = defs;
     ctl = this.withMarks(ctl);
-    this.setData(ctl, Array.isArray(ctl.marks) && ctl.marks.length ? this.marksKey : "");
+    const picks = this.picked.map((sr) => sr.slice?.value ?? "").join();
+    this.setData(ctl, Array.isArray(ctl.marks) && ctl.marks.length ? `${this.marksKey}|${picks}` : "");
+    this.extent = ctl.interacting && this.held ? this.held.extent : this.dataExtent; // dragging a slider: held
     this.ensureDense(ctl);
     this.setWindow(ctl);
     const v = this.view;
+    if (!ctl.interacting) this.held = { extent: this.extent, y: [v.y0, v.y1] }; // as shown when a drag starts
     const { w, h } = v;
     const info = this.hover(ctl);
 

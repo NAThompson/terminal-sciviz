@@ -3,7 +3,14 @@
  *
  * - data generated on the GPU from a small spec (`volume: {dataset: "hydrogen", n, l, m, ...}`,
  *   or `breathing`, `tight_binding`, `fermi`), by a compute shader writing straight into an r32float 3D
- *   texture (filtered: `float32-filterable`), cached by spec and slice;
+ *   texture (filtered: `float32-filterable`), cached by spec and slice; or read from a file
+ *   (`{dataset: "file", path, shape?, dtype?, axes?}`: `.npy`, or raw little-endian f32 / f64 with
+ *   `shape`), the whole stack kept on the CPU (as f32), one slice uploaded at a time, re-read when
+ *   the file changes; NaN voxels are transparent (no colour, opacity, isosurface or domain): uploaded
+ *   as 0 with a validity texture (r8unorm, 1 valid), a sample valid only where every voxel it
+ *   filters is (validity ≥ 1 − 1e-3), a marching-cubes cell only with 8 valid corners;
+ * - 4D stacks: the leading dimension is the `slice`; `sliders: {slice: {}}` (files: by default) draws
+ *   an in-frame slider over the slice axis' values (lib/sliders.ts), set by the mod as `sliderValues`;
  * - a single-pass ray marcher: DVR / MIP / Iso modes, opacity ramp above a threshold (of the
  *   distance from the centre value for diverging colouring, so values near it stay clear) with
  *   sampling-rate correction, colours over [value at threshold, max], gradient shading, jitter,
@@ -62,6 +69,7 @@ import { cameraBasis, fitAngles, fitView, screenRect as pixelRect, type Vec3 } f
 import { makeReadBuffer, rowBytes } from "./lib/gpu.ts";
 import { BitmapFont, type FontSize, FRAME_FORMAT, OverlayRenderer, premul, Quads, type Rgba, ROOT_HOT, rootSlider, type RootSlider, rootSliderHeight } from "./lib/overlay.ts";
 import { main, type Pending, type Renderer as ServeRenderer } from "./lib/serve.ts";
+import { drawSliders, nearestValue, resolveSliders, type Slider, type SliderDef, sliderHeight } from "./lib/sliders.ts";
 
 const INK = "#c9d1d9", INK2 = "#8b949e", HOVER_RING = "#e6edf3";
 const LABEL_FILL: Rgba = [20 / 255 * (240 / 255), 24 / 255 * (240 / 255), 30 / 255 * (240 / 255), 240 / 255];
@@ -72,6 +80,7 @@ const SAMPLES = 4;
 const DEPTH = "depth24plus";
 const ISO_COLORS = ["#4cc9f0", "#f72585", "#90be6d", "#f9c74f", "#b388ff"]; // one per level, cycled
 
+const VALID_MIN = 1 - 1e-3; // filtered validity of a sample whose voxels are all valid
 const DIVERGING = new Set(["BrBG", "PRGn", "PiYG", "PuOr", "RdBu", "RdGy", "RdYlBu", "RdYlGn", "Spectral"]);
 
 // --- Data: generator specs ---------------------------------------------------------------------
@@ -81,7 +90,8 @@ export type VolumeSpec =
   | { dataset: "hydrogen_spherical"; n?: number; l?: number; m?: number; nr?: number; ntheta?: number; nphi?: number; rmin?: number; rmax?: number }
   | { dataset: "breathing"; size?: number; frames?: number }
   | { dataset: "tight_binding"; size?: number }
-  | { dataset: "fermi"; size?: number };
+  | { dataset: "fermi"; size?: number }
+  | { dataset: "file"; path: string; shape?: number[]; dtype?: "f32" | "f64"; axes?: { lo: number; hi: number; label?: string; unit?: string }[]; nan?: "transparent" };
 
 interface AxisMeta { lo: number; hi: number; n: number; geometric?: boolean; label?: string; unit?: string }
 
@@ -95,6 +105,75 @@ export interface VolumeMeta {
   sameUnit: boolean; // all three axes in one unit: box sized by them (`withPhysicalAspect`)
   params: number[]; // n, l, m, quantity
   norm: [number, number]; // hydrogen radial and angular normalisation (f64 on the CPU)
+  sliceAxis?: AxisMeta; // of the leading dimension (files: `axes[3]`)
+  file?: Stack;
+}
+
+// --- Data: files ------------------------------------------------------------------------------
+
+/** A file's voxels: every slice, [slice][z][y][x] as f32. */
+interface Stack { path: string; mtime: number; version: string; shape: [number, number, number]; slices: number; data: Float32Array; readMs: number }
+const stacks = new Map<string, Stack>();
+const HERE = new URL("./", import.meta.url).pathname;
+const filePath = (p: string) => (p.startsWith("/") ? p : HERE + p); // relative: to deno/ (the gallery's assets)
+const mtimeOf = (path: string) => { try { return Deno.statSync(path).mtime?.getTime() ?? 0; } catch { return -1; } };
+/** What a cached load depends on beyond the spec: the file's modification time. */
+
+/** The stack of a file spec (once per path, shape, dtype and mtime): `.npy` (its header gives
+ * shape and dtype: little-endian f4 / f8, C order), else raw little-endian values (`.f32`, `.bin`,
+ * `.raw`; `.f64`), shape from the spec. */
+export function readStack(spec: Extract<VolumeSpec, { dataset: "file" }>): Stack {
+  if (typeof spec.path !== "string" || !spec.path) throw new Error("file volume: give path (a .npy, or raw .f32 / .bin with shape)");
+  if (spec.nan !== undefined && spec.nan !== "transparent") throw new Error(`file volume: nan must be "transparent" (got ${JSON.stringify(spec.nan)})`);
+  const path = filePath(spec.path);
+  const ext = (/\.([a-z0-9]+)$/i.exec(path)?.[1] ?? "").toLowerCase();
+  if (["nc", "nc4", "cdf", "h5", "hdf5", "he5", "hdf"].includes(ext)) throw new Error(`file volume ${path}: netCDF / HDF5 are not read yet; write the array as .npy or raw little-endian .f32 (with shape)`);
+  const mtime = mtimeOf(path);
+  if (mtime < 0) throw new Error(`file volume: no such file ${path}`);
+  const key = JSON.stringify([path, spec.shape, spec.dtype]);
+  const hit = stacks.get(key);
+  if (hit && hit.mtime === mtime) return hit;
+  const t0 = performance.now();
+  const bytes = Deno.readFileSync(path);
+  let shape: number[], dtype: "f32" | "f64", offset = 0;
+  if (ext === "npy") {
+    if (bytes[0] !== 0x93 || String.fromCharCode(...bytes.subarray(1, 6)) !== "NUMPY") throw new Error(`${path}: not a .npy file`);
+    const major = bytes[6];
+    const dv = new DataView(bytes.buffer, bytes.byteOffset);
+    const hlen = major === 1 ? dv.getUint16(8, true) : dv.getUint32(8, true);
+    offset = (major === 1 ? 10 : 12) + hlen;
+    const header = new TextDecoder().decode(bytes.subarray(major === 1 ? 10 : 12, offset));
+    // the header dict: keys and descr in either quote style, shape a tuple ("(5,)" too)
+    const descr = /["']descr["']\s*:\s*["']([^"']+)["']/.exec(header)?.[1];
+    const fortran = /["']fortran_order["']\s*:\s*(True|False)\b/.exec(header)?.[1];
+    const dims = /["']shape["']\s*:\s*\(([^)]*)\)/.exec(header)?.[1];
+    if (descr === undefined || fortran === undefined || dims === undefined) throw new Error(`${path}: .npy header without descr, fortran_order and shape: ${header.trim()}`);
+    if (fortran === "True") throw new Error(`${path}: fortran_order arrays are not read; save C order (np.ascontiguousarray)`);
+    dtype = descr === "<f4" ? "f32" : descr === "<f8" ? "f64" : (() => { throw new Error(`${path}: dtype ${descr} not read; save little-endian float32 or float64 ('<f4', '<f8')`); })();
+    shape = dims.split(",").map((v) => v.trim()).filter(Boolean).map(Number);
+  } else if (["f32", "bin", "raw", "f64"].includes(ext)) {
+    if (!Array.isArray(spec.shape)) throw new Error(`file volume ${path}: raw data needs shape [nz, ny, nx] or [ns, nz, ny, nx]`);
+    shape = spec.shape.map(Number);
+    dtype = spec.dtype ?? (ext === "f64" ? "f64" : "f32");
+    if (dtype !== "f32" && dtype !== "f64") throw new Error(`file volume: dtype must be "f32" or "f64"`);
+  } else throw new Error(`file volume ${path}: unknown format .${ext} (read: .npy, raw .f32 / .bin / .raw / .f64)`);
+  if (!(shape.length === 3 || shape.length === 4) || shape.some((n) => !Number.isInteger(n) || n < 1)) throw new Error(`file volume ${path}: shape must be 3 or 4 positive integers, got [${shape}]`);
+  if (shape.length === 3) shape = [1, ...shape];
+  const [ns, nz, ny, nx] = shape;
+  if ([nz, ny, nx].some((n) => n < 2 || n > 1024)) throw new Error(`file volume ${path}: z, y, x sizes must be in [2, 1024], got [${shape.slice(1)}]`);
+  const count = ns * nz * ny * nx, size = dtype === "f64" ? 8 : 4;
+  if (bytes.length - offset !== count * size) throw new Error(`file volume ${path}: ${bytes.length - offset} bytes of data, shape [${shape}] of ${dtype} needs ${count * size}`);
+  const raw = (offset + bytes.byteOffset) % size ? bytes.slice(offset).buffer : bytes.buffer;
+  const at = raw === bytes.buffer ? bytes.byteOffset + offset : 0;
+  const data = dtype === "f64" ? Float32Array.from(new Float64Array(raw, at, count)) : new Float32Array(raw, at, count);
+  for (let i = 0; i < count; i += 1) { // NaN is allowed (transparent); ±∞, or beyond f32 (|v| > 3.4e38), not
+    const v = data[i];
+    if (v === Infinity || v === -Infinity) throw new Error(`file volume ${path}: value ${dtype === "f64" ? new Float64Array(raw, at, count)[i] : v} at flat index ${i} is not a finite f32 (|v| ≤ 3.4e38); use NaN for missing values`);
+  }
+  const st: Stack = { path, mtime, version: `${mtime}:${bytes.length}`, shape: [nz, ny, nx], slices: ns, data, readMs: performance.now() - t0 };
+  for (const [k, v] of stacks) if (v.path === path) stacks.delete(k); // one version per file
+  stacks.set(key, st);
+  return st;
 }
 
 const factorial = (k: number) => { let f = 1; for (let i = 2; i <= k; i += 1) f *= i; return f; };
@@ -148,6 +227,21 @@ export function volumeMeta(spec: VolumeSpec): VolumeMeta {
       const s = size(spec.size, 64);
       const ax = (name: string) => linspaceAxis(-Math.PI, Math.PI, s, name, "1/a");
       return { kind: 4, shape: [s, s, s], slices: 1, axes: [ax("𝑘ₓ"), ax("𝑘𝑦"), ax("𝑘𝑧")], sameUnit: true, params: [0, 0, 0, 0], norm: [0, 0] };
+    }
+    case "file": {
+      const st = readStack(spec);
+      const [nz, ny, nx] = st.shape;
+      const given = spec.axes;
+      if (given !== undefined && !(Array.isArray(given) && given.length >= 3 && given.every((a) => a && Number.isFinite(Number(a.lo)) && Number.isFinite(Number(a.hi))))) {
+        throw new Error("file volume: axes must be [x, y, z] or [x, y, z, slice], each {lo, hi, label?, unit?}");
+      }
+      const ax = (i: number, n: number): AxisMeta => (given?.[i] ? linspaceAxis(Number(given[i].lo), Number(given[i].hi), n, given[i].label, given[i].unit) : linspaceAxis(0, n - 1, n));
+      const axes: [AxisMeta, AxisMeta, AxisMeta] = [ax(0, nx), ax(1, ny), ax(2, nz)];
+      const units = new Set(axes.map((a) => a.unit));
+      return {
+        kind: 5, shape: [nz, ny, nx], slices: st.slices, axes, sameUnit: Boolean(given) && units.size === 1, params: [0, 0, 0, 0], norm: [0, 0],
+        sliceAxis: given?.[3] ? ax(3, st.slices) : undefined, file: st,
+      };
     }
     default:
       throw new Error(`Unknown volume dataset ${(spec as { dataset: unknown }).dataset}`);
@@ -289,6 +383,7 @@ const MC_WGSL = /* wgsl */ `
   @group(0) @binding(5) var<storage, read> centres: array<f32>; // relative voxel centres: x, y then z
   @group(0) @binding(6) var<storage, read_write> counts: array<u32>; // per cell, then offsets
   @group(0) @binding(7) var<storage, read_write> verts: array<vec4f>; // position, normal per vertex
+  @group(0) @binding(8) var validity: texture_3d<f32>; // 1 valid, 0 NaN (1 × 1 × 1: all valid)
 
   const EDGES = array<vec2u, 12>(
     vec2u(0, 1), vec2u(2, 3), vec2u(4, 5), vec2u(6, 7),
@@ -320,6 +415,7 @@ const MC_WGSL = /* wgsl */ `
   }
 
   fn value(p: vec3u) -> f32 { return textureLoad(data, p, 0).r; }
+  fn validAt(p: vec3u) -> bool { return textureDimensions(validity).x == 1u || textureLoad(validity, p, 0).r > 0.5; }
 
   // Gradient component: central differences, one-sided at borders or next to invalid values
   fn partial(p: vec3u, axis: u32) -> f32 {
@@ -331,8 +427,8 @@ const MC_WGSL = /* wgsl */ `
     if (p[axis] < n - 1u) { hi[axis] += 1u; }
     var vLo = value(lo);
     var vHi = value(hi);
-    if (!isValid(vLo)) { lo = p; vLo = centre; }
-    if (!isValid(vHi)) { hi = p; vHi = centre; }
+    if (!isValid(vLo) || !validAt(lo)) { lo = p; vLo = centre; }
+    if (!isValid(vHi) || !validAt(hi)) { hi = p; vHi = centre; }
     if (hi[axis] == lo[axis]) { return 0.0; }
     return (vHi - vLo) / f32(hi[axis] - lo[axis]);
   }
@@ -399,7 +495,7 @@ const MC_WGSL = /* wgsl */ `
     var caseIndex = 0u;
     for (var n = 0u; n < 8u; n++) {
       let v = value(cell + corner(n));
-      if (!isValid(v)) { if (!emit) { counts[index] = 0u; } return; }
+      if (!isValid(v) || !validAt(cell + corner(n))) { if (!emit) { counts[index] = 0u; } return; }
       cv[n] = v;
       if (v < u.level) { caseIndex |= 1u << n; }
     }
@@ -559,6 +655,7 @@ const VOLUME_WGSL = /* wgsl */ `
   @group(0) @binding(3) var<storage, read> colorMap: array<u32>; // 256 RGBA8 (sRGB)
   @group(0) @binding(4) var<storage, read> lookups: array<f32>;
   @group(0) @binding(5) var surfaceDepth: texture_depth_2d;
+  @group(0) @binding(6) var validity: texture_3d<f32>; // 1 valid, 0 NaN (1 × 1 × 1: all valid)
 
   const oneOverLog10 = 0.43429448190325176;
   const MAX_STEPS = 4096;
@@ -645,8 +742,10 @@ const VOLUME_WGSL = /* wgsl */ `
   }
 
   fn sampleRaw(p: vec3f) -> vec2f {
-    let value = textureSampleLevel(volume, volumeSampler, toTexCoords(p), 0.0).r;
-    return select(vec2f(0.0), vec2f(value, 1.0), !isnan(value));
+    let t = toTexCoords(p);
+    let value = textureSampleLevel(volume, volumeSampler, t, 0.0).r;
+    let valid = textureSampleLevel(validity, volumeSampler, t, 0.0).r >= ${VALID_MIN}; // every voxel filtered valid
+    return select(vec2f(0.0), vec2f(value, 1.0), valid && !isnan(value));
   }
 
   fn linearPosition(raw: f32) -> f32 {
@@ -907,6 +1006,8 @@ export const DEFAULTS = {
   height: 750,
   volume: { dataset: "hydrogen", n: 3, l: 2, m: 1 } as VolumeSpec,
   slice: 0, // leading dimension (4D)
+  sliders: null as Record<string, unknown> | false | null, // {slice: {label?}}: a slider over the slice axis (file stacks: by default; false: none)
+  sliderValues: null as Record<string, number> | null, // set by dragging it: the slice axis value
   title: null as string | null, // default: generator's
   subtitle: "",
   colormap: "Inferno" as string, // or "auto": RdBu (symmetric) if the domain spans `center`, else Viridis
@@ -946,6 +1047,7 @@ interface Data {
   meta: VolumeMeta;
   slice: number;
   texture: GPUTexture;
+  validity?: GPUTexture; // of a file slice with NaN
   values: Float32Array; // read back: domain, hover, Fermi level
   dataDomain: [number, number];
   fermi?: number;
@@ -1021,6 +1123,10 @@ export class VolumePlot implements ServeRenderer<Control> {
   private size: [number, number] = [1, 1];
   private scale = 1;
   private slider: RootSlider | null = null; // of the root scale, as drawn
+  private sliceDef?: SliderDef; // the slice slider's value and range
+  private sliders: Slider[] = []; // as drawn
+  private uploadMs = 0; // of the last file slice
+  private readonly allValid: GPUTexture; // 1 × 1 × 1 validity of data without NaN
   // Of the last frame, for the hover read-out and state.json
   content: [number, number, number, number] | null = null; // the box's pixels, for the client (state)
   private view!: {
@@ -1087,6 +1193,8 @@ export class VolumePlot implements ServeRenderer<Control> {
     this.sampler = device.createSampler({ magFilter: "linear", minFilter: "linear", addressModeU: "clamp-to-edge", addressModeV: "clamp-to-edge", addressModeW: "clamp-to-edge" });
     this.volumeUniforms = device.createBuffer({ size: 68 * 4, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     this.lineUniforms = device.createBuffer({ size: 80, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    this.allValid = device.createTexture({ size: [1, 1, 1], dimension: "3d", format: "r8unorm", usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
+    device.queue.writeTexture({ texture: this.allValid }, Uint8Array.of(255), { bytesPerRow: 1, rowsPerImage: 1 }, [1, 1, 1]);
   }
 
   static async create(): Promise<VolumePlot> {
@@ -1120,10 +1228,30 @@ export class VolumePlot implements ServeRenderer<Control> {
 
   // Data -------------------------------------------------------------------------------------------
 
-  /** Generates a slice into a fresh texture (compute), and reads it back. */
-  private async generate(meta: VolumeMeta, slice: number): Promise<{ texture: GPUTexture; values: Float32Array }> {
+  /** Generates a slice into a fresh texture (compute), and reads it back; a file's slice is uploaded. */
+  private async generate(meta: VolumeMeta, slice: number): Promise<{ texture: GPUTexture; validity?: GPUTexture; values: Float32Array }> {
     const { device } = this;
     const [nz, ny, nx] = meta.shape;
+    if (meta.file) {
+      const t0 = performance.now();
+      const n = nx * ny * nz;
+      const values = meta.file.data.subarray(slice * n, (slice + 1) * n);
+      let gpu = values, valid: Uint8Array | undefined;
+      for (let i = 0; i < n; i += 1) {
+        if (values[i] !== values[i]) { // NaN: 0 in a copy, invalid
+          if (!valid) [gpu, valid] = [values.slice(), new Uint8Array(n).fill(255)];
+          [gpu[i], valid[i]] = [0, 0];
+        }
+      }
+      const tex = (format: GPUTextureFormat, data: Float32Array | Uint8Array, bytes: number) => {
+        const t = device.createTexture({ size: [nx, ny, nz], dimension: "3d", format, usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
+        device.queue.writeTexture({ texture: t }, data, { bytesPerRow: nx * bytes, rowsPerImage: ny }, [nx, ny, nz]);
+        return t;
+      };
+      const texture = tex("r32float", gpu, 4), validity = valid && tex("r8unorm", valid, 1);
+      this.uploadMs = performance.now() - t0;
+      return { texture, validity, values };
+    }
     const texture = device.createTexture({
       size: [nx, ny, nz],
       dimension: "3d",
@@ -1172,26 +1300,27 @@ export class VolumePlot implements ServeRenderer<Control> {
   /** The volume of the spec and slice (cached by spec): the data domain over every slice
    * (`useStableDomain` during playback), and the Fermi level (median, half filling). */
   private loadData(spec: VolumeSpec, slice: number, scaleType: ScaleType, ignore?: (v: number) => boolean): Promise<Data> {
-    const key = JSON.stringify([spec, slice, scaleType, !!ignore]);
+    const meta = volumeMeta(spec); // a file's stack read (once per version) now: data and domain of this one
+    const version = meta.file?.version ?? "";
+    const key = JSON.stringify([spec, slice, scaleType, !!ignore, version]);
     let p = this.dataCache.get(key);
     if (!p) {
       p = (async () => {
-        const meta = volumeMeta(spec);
         const s = Math.min(Math.max(Math.trunc(slice), 0), meta.slices - 1);
-        const { texture, values } = await this.generate(meta, s);
-        const domain = await this.stableDomain(spec, meta, scaleType, ignore, s, values);
+        const { texture, validity, values } = await this.generate(meta, s);
+        const domain = await this.stableDomain(spec, meta, scaleType, ignore, s, values, version);
         let fermi: number | undefined;
         if (meta.kind === 4) {
           const sorted = Float64Array.from(values).sort();
           const n = sorted.length;
           fermi = n % 2 ? sorted[(n - 1) / 2] : (sorted[n / 2 - 1] + sorted[n / 2]) / 2; // np.median
         }
-        return { key, meta, slice: s, texture, values, dataDomain: domain ?? [...DEFAULT_DOMAIN], fermi } as Data;
+        return { key, meta, slice: s, texture, validity, values, dataDomain: domain ?? [...DEFAULT_DOMAIN], fermi } as Data;
       })();
       p.catch(() => this.dataCache.delete(key));
       if (this.dataCache.size >= 24) {
         const [oldest] = this.dataCache.keys();
-        this.dataCache.get(oldest)?.then((d) => d !== this.data && d.texture.destroy());
+        this.dataCache.get(oldest)?.then((d) => { if (d !== this.data) { d.texture.destroy(); d.validity?.destroy(); } });
         this.dataCache.delete(oldest);
       }
       this.dataCache.set(key, p);
@@ -1201,17 +1330,19 @@ export class VolumePlot implements ServeRenderer<Control> {
 
   /** Data domain over every slice (cached by spec and scale, once per stack: playback requests
    * each slice in turn); slice `s`'s `values` are at hand, the others are generated for it. */
-  private stableDomain(spec: VolumeSpec, meta: VolumeMeta, scaleType: ScaleType, ignore: ((v: number) => boolean) | undefined, s: number, values: Float32Array): Promise<[number, number] | null> {
-    const key = JSON.stringify([spec, scaleType, !!ignore]);
+  private stableDomain(spec: VolumeSpec, meta: VolumeMeta, scaleType: ScaleType, ignore: ((v: number) => boolean) | undefined, s: number, values: Float32Array, version: string): Promise<[number, number] | null> {
+    const key = JSON.stringify([spec, scaleType, !!ignore, version]);
     let p = this.domainCache.get(key);
     if (!p) {
       p = (async () => {
+        if (meta.file) return getDomain(meta.file.data, scaleType, ignore) ?? null; // the whole stack, on the CPU (NaN skipped)
         let lo = Infinity, hi = -Infinity;
         for (let k = 0; k < meta.slices; k += 1) {
           let vals = values;
           if (k !== s) { // other slices: domain only
             const other = await this.generate(meta, k);
             other.texture.destroy();
+            other.validity?.destroy();
             vals = other.values;
           }
           const d = getDomain(vals, scaleType, ignore);
@@ -1264,6 +1395,7 @@ export class VolumePlot implements ServeRenderer<Control> {
         { binding: 5, resource: { buffer: centreBuf } },
         { binding: 6, resource: { buffer: counts } },
         { binding: 7, resource: { buffer: verts } },
+        { binding: 8, resource: (data.validity ?? this.allValid).createView() },
       ],
     });
     const temps: GPUBuffer[] = [ub, centreBuf, dummy];
@@ -1453,7 +1585,8 @@ export class VolumePlot implements ServeRenderer<Control> {
     this.size = [w, h];
     const preScale: ScaleType = ctl.scale === "log" ? "log" : ctl.scale === "symlog" ? "symlog" : ctl.scale === "sqrt" || ctl.scale === "root" ? "gamma" : "linear";
     const ignore = ctl.valueTransform ? (v: number) => !Number.isFinite(v) : undefined; // logarithms: ±∞ ignored
-    const data = await this.loadData(ctl.volume, Number(ctl.slice) || 0, preScale, ignore);
+    const slice = this.sliceSlider(ctl);
+    const data = await this.loadData(ctl.volume, slice, preScale, ignore);
     this.data = data;
     const meta = data.meta;
     const [nz, ny, nx] = meta.shape;
@@ -1499,7 +1632,8 @@ export class VolumePlot implements ServeRenderer<Control> {
 
     // Camera: fitted to the box corners, as curve.ts
     const bar = Math.round(150 * s);
-    const [L, T, R, B] = [Math.round(16 * s), Math.round(56 * s), w - Math.round(16 * s) - bar, h - Math.round(16 * s)];
+    const row = this.sliceDef ? sliderHeight(this.fonts(s).label, s) + Math.round(14 * s) : 0; // the slice slider: a row under the title
+    const [L, T, R, B] = [Math.round(16 * s), Math.round(56 * s) + row, w - Math.round(16 * s) - bar, h - Math.round(16 * s)];
     const [pw, ph] = [R - L, B - T];
     const b2w = boxToWorld(String(ctl.up));
     const corners: number[] = [];
@@ -1685,6 +1819,7 @@ export class VolumePlot implements ServeRenderer<Control> {
           { binding: 3, resource: { buffer: this.colorMapBuffer(colors.colormap, !!ctl.invertColormap) } },
           { binding: 4, resource: { buffer: this.lookupBuffer! } },
           { binding: 5, resource: tg.isoDepth.createView() },
+          { binding: 6, resource: (data.validity ?? this.allValid).createView() },
         ],
       }));
       vp.draw(36);
@@ -1712,6 +1847,7 @@ export class VolumePlot implements ServeRenderer<Control> {
     const title = ctl.title ?? (data.fermi !== undefined ? `Fermi surface 𝐸(𝐤) = ${data.fermi.toFixed(2)} eV (half filling)` : "");
     const tw = title ? q.text(title, L + Math.round(50 * s), Math.round(28 * s), F.title, premul(INK), "lm") : 0;
     if (ctl.subtitle) q.text(String(ctl.subtitle), L + Math.round(50 * s) + tw + Math.round(16 * s), Math.round(28 * s), F.sub, premul(INK2), "lm");
+    this.sliders = drawSliders(q, F.label, this.sliceDef ? [this.sliceDef] : [], L + Math.round(50 * s), Math.round(48 * s), Math.round(220 * s), 0, s, false, ctl.sliderHot);
     // Root scale: its slider under the colour bar (raised to make room)
     const root = Array.isArray(colors.vis) && colors.vis[0] === "root" ? colors.vis[1] : null;
     const sliderTop = B - Math.round(10 * s) - rootSliderHeight(F.label, s);
@@ -1858,6 +1994,22 @@ export class VolumePlot implements ServeRenderer<Control> {
     q.text(bound(lo, "−∞"), x + bw / 2, bottom + Math.round(8 * s), F.label, premul(INK), "mt");
   }
 
+  /** The slice to show: the slider's (`sliderValues.slice`, an axis value snapped to a slice) when
+   * it is shown, else `slice`; the slider's def kept for drawing. */
+  private sliceSlider(ctl: Control): number {
+    const meta = volumeMeta(ctl.volume); // small (a file's stack is cached)
+    const index = Math.min(Math.max(Math.trunc(Number(ctl.slice) || 0), 0), meta.slices - 1);
+    const sl = ctl.sliders as Record<string, unknown> | false | null;
+    const shown = meta.slices > 1 && sl !== false && (sl ? Object.hasOwn(sl, "slice") : ctl.volume.dataset === "file");
+    if (sl && Object.keys(sl).some((k) => k !== "slice")) throw new Error(`sliders: a volume has one, slice (got ${Object.keys(sl).join(", ")})`);
+    this.sliceDef = undefined;
+    if (!shown) return index;
+    const values = Array.from(meta.sliceAxis ? axisValues(meta.sliceAxis) : Array.from({ length: meta.slices }, (_, i) => i)); // full precision: labels round
+    const spec = sl && typeof sl.slice === "object" && sl.slice ? sl.slice : {};
+    [this.sliceDef] = resolveSliders({ slice: { label: meta.sliceAxis?.label ?? "slice", value: values[index], ...spec } }, ctl.sliderValues, [], { slice: values });
+    return values.indexOf(nearestValue(values, this.sliceDef.value));
+  }
+
   // Hover ------------------------------------------------------------------------------------------
 
   /** CPU read-out along the hover ray (the read-back voxels, trilinear as the texture): the first
@@ -1888,13 +2040,14 @@ export class VolumePlot implements ServeRenderer<Control> {
       const g = tex.map((t, a) => t * counts[a] - 0.5);
       const i0 = g.map(Math.floor);
       const fr = g.map((x, a) => x - i0[a]);
-      let val = 0;
+      let val = 0, valid = 0; // as the ray marcher: NaN voxels as 0, valid where ≥ 1 − 1e-3 of the weight is
       for (let n = 0; n < 8; n += 1) {
         const o = [n & 1, (n >> 1) & 1, (n >> 2) & 1];
         const wgt = o.reduce((acc, b, a) => acc * (b ? fr[a] : 1 - fr[a]), 1);
-        val += wgt * at(i0[0] + o[0], i0[1] + o[1], i0[2] + o[2]);
+        const v = at(i0[0] + o[0], i0[1] + o[1], i0[2] + o[2]);
+        if (v === v) [val, valid] = [val + wgt * v, valid + wgt];
       }
-      return { value: val, tex };
+      return { value: valid >= VALID_MIN ? val : NaN, tex };
     };
     const [shaderScale, gamma, symC] = [c.shaderScale, c.gammaExponent, c.symlogConstant];
     const scaled = (x: number) => shaderScale === "log" ? Math.log10(x) : shaderScale === "symlog" ? Math.sign(x) * Math.log1p(Math.abs(x) / symC) / Math.LN10 : shaderScale === "sqrt" ? Math.sqrt(x) : x;
@@ -1958,7 +2111,10 @@ export class VolumePlot implements ServeRenderer<Control> {
     const meta = this.data!.meta;
     const names = ["𝑥", "𝑦", "𝑧"];
     const rows: [string, string][] = meta.axes.map((a, i) => [a.label ?? names[i], formatNumber(info.coords[i])]);
-    if (meta.slices > 1) rows.unshift(["slice", String(info.slice)]);
+    if (meta.slices > 1) {
+      const a = meta.sliceAxis;
+      rows.unshift(a ? [a.label ?? "slice", `${formatNumber(axisValues(a)[info.slice])}${a.unit ? ` ${a.unit}` : ""}  (${info.slice + 1}/${meta.slices})`] : ["slice", String(info.slice)]);
+    }
     rows.push([ctl.valueLabel ?? "value", formatNumber(info.value)]);
     if (info.isosurface !== null) rows.push(["isosurface", formatNumber(info.isosurface)]);
     if (this.slider) rows.push(["ⁿ√ n", this.slider.value.toFixed(2)]);
@@ -1993,6 +2149,9 @@ export class VolumePlot implements ServeRenderer<Control> {
       shape: meta.shape, slice: this.data!.slice, slices: meta.slices, boxSize: this.view.boxSize,
       dataDomain: this.data!.dataDomain, domain: c.domain, colorDomain: c.barDomain, colormap: c.colormap, scale: c.vis,
       ...(this.slider ? { rootN: this.slider.value, rootSlider: this.slider } : {}),
+      ...(this.sliders.length ? { sliders: this.sliders } : {}),
+      ...(meta.sliceAxis ? { sliceValue: axisValues(meta.sliceAxis)[this.data!.slice] } : {}),
+      ...(meta.file ? { file: { path: meta.file.path, readMs: Math.round(meta.file.readMs), sliceUploadMs: Math.round(this.uploadMs * 100) / 100 } } : {}),
       isosurfaces: this.isoStats,
       fermiLevel: this.data!.fermi ?? null,
     };
