@@ -132,7 +132,7 @@ const viewInfo: Record<string, { interaction: Interaction; home: Ctl; entry?: En
 const opens: Record<string, { kind: Kind; interaction: Interaction; home: Ctl; entry?: Entry; bound?: string }> = {}
 let latestOpen = '' // the newest open's token: its row becomes live when it renders
 let openSeq = 0
-const view = { live: '', liveMinRev: 0, intended: '', cols: 80, rows: 25, pxW: 960, pxH: 600, input: null as null | { cols: number; rows: number; rect: number[] },
+const view = { live: '', liveMinRev: 0, intended: '', cols: 80, rows: 25, pxW: 960, pxH: 600, input: null as null | { cols: number; rows: number; rect: number[]; extra?: number[][] },
   drag: null as null | { x: number; y: number; ctl: Ctl; win: Win | null; zooming: boolean } }
 
 const cycle = (list: string[], cur: string) => list[(list.indexOf(cur) + 1) % list.length]
@@ -388,6 +388,11 @@ async function drawView($: any, e: any, id: string, kind: Kind) {
       <Box position="absolute" top={inRect[1]} left={inRect[0]}>
         <Client key="input" module="./input.tsx" width={inRect[2]} height={inRect[3]} />
       </Box>
+      {(view.input && view.input.cols === cols && view.input.rows === rows ? view.input.extra ?? [] : []).map((r) => (
+        <Box key={`in-${r.join(',')}`} position="absolute" top={r[1]} left={r[0]}>
+          <Client key={`input-${r.join(',')}`} module="./input.tsx" props={{ off: [r[0], r[1]] }} width={r[2]} height={r[3]} />
+        </Box>
+      ))}
       {hints ? ( // in the view's top row, right-aligned (by the title): no row of its own below it
         <Box position="absolute" top={0} left={Math.max(0, cols - hints.length - 1)}>
           <Text dimColor>{hints}</Text>
@@ -571,6 +576,7 @@ async function refreshInputRect($: any, kind: Kind) {
   try { st = JSON.parse(await $.fs.read(`${dir(kind)}/state.json`)) } catch { return }
   const { cols, rows } = view
   let rect: number[] | null = null
+  const extra: number[][] = []
   const content = st?.content ?? st?.plotRect // 3D: the object's box; 2D: the plot area (pan, zoom, hover)
   if (Array.isArray(content) && st.width > 0 && st.height > 0) {
     const boxes = [content, ...stateSliders(st).map((sl) => sl.rect)]
@@ -581,10 +587,19 @@ async function refreshInputRect($: any, kind: Kind) {
     // and what follows it (text to select) is drawn there
     const cx1 = Math.min(cols, Math.ceil((x1 / st.width) * cols) + 1), cy1 = Math.min(rows - 2, Math.floor((y1 / st.height) * rows))
     if (cx1 > cx0 && cy1 > cy0) rect = [cx0, cy0, cx1 - cx0, cy1 - cy0]
+    // a slider in those bottom rows (the volume's root scale under its colour bar): an input strip
+    // of its own, just its columns, so the rest of the rows stays selectable
+    if (rect) for (const sl of stateSliders(st)) {
+      const sy1 = Math.min(rows, Math.ceil((sl.rect[3] / st.height) * rows))
+      if (sy1 <= cy1) continue
+      const sx0 = Math.max(0, Math.floor((sl.rect[0] / st.width) * cols) - 1), sx1 = Math.min(cols, Math.ceil((sl.rect[2] / st.width) * cols) + 1)
+      extra.push([sx0, cy1, sx1 - sx0, sy1 - cy1])
+    }
   }
-  const was = view.input?.rect?.join(',') ?? ''
-  view.input = rect ? { cols, rows, rect } : null
-  if ((rect?.join(',') ?? '') !== was) $.ui.invalidate('ui.render')
+  const key = (i: typeof view.input) => JSON.stringify(i ? [i.rect, i.extra] : null)
+  const was = key(view.input)
+  view.input = rect ? { cols, rows, rect, extra } : null
+  if (key(view.input) !== was) $.ui.invalidate('ui.render')
 }
 
 let overlaySeq = 0
@@ -606,15 +621,17 @@ async function onPointer($: any, kind: Kind, ev: any) {
   // the image's own size in cells: the input region can be clipped by the screen edge, the image's coordinates are not
   const cols = view.cols || ev.columns, rows = view.rows || ev.rows
   // region-relative -> view cells: the input region may be only the object's part of the view
-  const off = view.input && view.input.cols === cols && view.input.rows === rows ? view.input.rect : [0, 0]
+  const off = Array.isArray(ev.off) ? ev.off : view.input && view.input.cols === cols && view.input.rows === rows ? view.input.rect : [0, 0]
   const x = (ev.fine?.x ?? ev.x + 0.5) + off[0], y = (ev.fine?.y ?? ev.y + 0.5) + off[1]
   // a move with no button held while a drag is open: its `up` was lost (outside the view, a remount).
   // End the drag, or every hover would keep orbiting the camera and re-rendering.
   if (view.drag && ev.type === 'move' && !ev.button) ev = { ...ev, type: 'up' }
+  // a held drag (slider or orbit) owns the pointer until `up`: crossing the region's edge doesn't end it
+  if (view.drag && ev.type === 'leave') return
   // For the native overlay (overlay/*.ts): where the pointer is in the view, in cells; the
   // overlay pairs it with the global mouse position to place itself exactly over the view.
   void writeOverlay($, JSON.stringify({ seq: ++overlaySeq, type: ev.type, x, y, cols, rows,
-    fine: !!ev.fine, drag: ev.type === 'down' || (!!view.drag && ev.type !== 'up' && ev.type !== 'leave'), kind, id: view.live }))
+    fine: !!ev.fine, drag: ev.type === 'down' || (!!view.drag && ev.type !== 'up'), kind, id: view.live }))
   const sliderAt = async () => {
     // sliders: given, the root scale's, a mark's slice column's or a file volume's slice (added by the renderer)
     const sliced = ctl.volume?.dataset === 'file' || (Array.isArray(ctl.marks) && ctl.marks.some((m: any) => m?.slice !== undefined))
@@ -670,7 +687,7 @@ async function onPointer($: any, kind: Kind, ev: any) {
     // lower resolution while orbiting (3D frames cost most); 2D keeps its layout so pan/zoom stay anchored
     // while orbiting: fewer pixels, and renderers that support it (volume.ts) cut their ray-march samples
     if (interaction === 'orbit') Object.assign(ctl, { width: Math.round(view.pxW * DRAG_SCALE), height: Math.round(view.pxH * DRAG_SCALE), interacting: true })
-  } else if (ev.type === 'up' || (ev.type === 'leave' && view.drag)) {
+  } else if (ev.type === 'up') {
     const slid = !!(view.drag as any)?.slider
     view.drag = null
     if (interaction === 'orbit') Object.assign(ctl, { width: view.pxW, height: view.pxH, interacting: false })

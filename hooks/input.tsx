@@ -1,7 +1,7 @@
 // Transparent input layer over the view: forwards pointer and key events to the hooks module.
 // `post` keeps only the latest undelivered message per frame, so events are queued and sent as one
 // batch per frame (consecutive moves coalesced), never dropping a down/up/key.
-export default function Input(_props: unknown, s: any) {
+export default function Input(props: any, s: any) {
   if (s.state === undefined) {
     let queue: any[] = []
     const push = (ev: any) => {
@@ -9,7 +9,9 @@ export default function Input(_props: unknown, s: any) {
       if (ev.type === 'move' && last?.type === 'move' && !!last.button === !!ev.button) queue[queue.length - 1] = ev
       else queue.push(ev)
     }
-    s.onPointer((ev: any) => push({ ...ev, columns: s.columns, rows: s.rows }))
+    // a strip of its own (a slider below the main region) says where it sits in the view
+    const off = Array.isArray(props?.off) ? props.off : undefined
+    s.onPointer((ev: any) => push({ ...ev, columns: s.columns, rows: s.rows, off }))
     s.onKey((ev: any) => push({ type: 'key', ...ev }))
     s.every(16, () => {
       if (!queue.length) return
