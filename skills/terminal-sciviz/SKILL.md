@@ -38,7 +38,8 @@ In 3D views only the object itself takes the mouse; the user can select text in 
 around it. Tell the user how to drive a live view the first time: drag (pan in 2D, orbit in 3D),
 shift-drag or `+`/`-` (zoom), hover (values drawn next to the cursor), click the view then
 `c`/`C` (cycle colour maps within their group), `i` (invert), `r` (reset). Their one slash command:
-`/sciviz [section]` shows a contact sheet, `/sciviz <entry>` (e.g. `lorenz`) opens a live view.
+`/sciviz` shows an overview, `/sciviz <section>` a contact sheet (lines, curves, complex, volumes,
+scenes, surfaces), `/sciviz <entry>` (e.g. `lorenz`, `teapot`) opens a live view.
 
 ## Where to compute the data
 

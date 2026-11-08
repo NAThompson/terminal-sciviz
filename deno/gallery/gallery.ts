@@ -29,9 +29,32 @@ const HERE = new URL("./", import.meta.url);
 const ROOT = new URL("../", import.meta.url);
 const INDEX = new URL("index.json", HERE);
 const DOCS = new URL("../../docs/", import.meta.url);
-const SECTIONS: Section[] = ["lines", "curves", "complex", "volumes", "scenes"];
+const SECTIONS: Section[] = ["lines", "curves", "complex", "volumes", "scenes", "surfaces"];
 const INK = [0xc9, 0xd1, 0xd9], INK2 = [0x8b, 0x94, 0x9e];
 const MAX_TOL = 3, MEAN_TOL = 0.01;
+
+/** The NURBS surfaces of `/sciviz <name>`: sheet only, not in `check` or the manifest. */
+const SURFACE_ENTRIES: Entry[] = ([
+  ["torus", "exact rational torus; field cos 3θ + sin φ", {}],
+  ["sphere", "exact rational sphere; field x y", {}],
+  ["wave", "rational bicubic patch, non-uniform knots; field unrelated to height", {}],
+  ["dini", "Dini's surface: pseudospherical (curvature −1), coloured by height", {}],
+  ["breather", "sine-Gordon breather, coloured by the sine-Gordon angle", {}],
+  ["teapot", "Newell's 32 bicubic Bézier patches, by height", {}],
+] as [string, string, Record<string, unknown>][]).map(([id, description, control]) => ({
+  id, section: "surfaces", title: id, description, renderer: "surface.ts", control: { surface: id, ...control }, interaction: "orbit",
+}));
+
+/** Bands of the overview sheet, in order; each flows onto a grid of OVERVIEW_COLS tiles. */
+const OVERVIEW_COLS = 4, OVERVIEW_THUMB = 400;
+const OVERVIEW: [Section, string[]][] = [
+  ["lines", ["lines/marks_violin", "lines/marks_heatmap", "lines/bessel_Jn", "lines/marks_bubble"]],
+  ["curves", ["curves/lorenz", "curves/trefoil_curvature"]],
+  ["complex", ["complex/rational", "complex/cubic_surface"]],
+  ["volumes", ["volumes/orbital_iso", "volumes/fermi_surface", "volumes/file_slices", "volumes/tight_binding"]],
+  ["scenes", ["scenes/convex_hull", "scenes/torus_cloud"]],
+  ["surfaces", ["teapot", "breather"]],
+];
 
 /** Entries of every section. Each module is required: a missing or broken one fails the run. */
 async function loadEntries(): Promise<Entry[]> {
@@ -155,6 +178,53 @@ function thumbnail(entry: Entry, rgba: Uint8Array, width: number, height: number
   return { entry, rgba: t.rgba, w: t.w, h: t.h };
 }
 
+/** A thumbnail at (x, top), with a faint frame so empty space reads as the plot's extent. */
+function blit(img: Uint8Array, W: number, { rgba, w, h }: Thumb, x: number, top: number): void {
+  for (let j = 0; j < h; j += 1) {
+    img.set(rgba.subarray(j * w * 4, (j + 1) * w * 4), ((top + j) * W + x) * 4);
+  }
+  const edge = (o: number) => {
+    if (img[o + 3] === 0) img.set([0x30, 0x36, 0x3d, 255], o);
+  };
+  for (let i = 0; i < w; i += 1) for (const yy of [top, top + h - 1]) edge((yy * W + x + i) * 4);
+  for (let j = 0; j < h; j += 1) for (const xx of [x, x + w - 1]) edge(((top + j) * W + xx) * 4);
+}
+
+/** docs/contact_overview.png: one band per section, its command in the heading. */
+async function overviewSheet(thumbs: Thumb[], path: string): Promise<void> {
+  const font = await BitmapFont.load(new URL("assets/", ROOT));
+  const title = font.get("bold", 15), head = font.get("bold", 22);
+  const tiles = (ids: string[]) => ids.map((id) => {
+    const t = thumbs.find((x) => x.entry.id === id);
+    if (!t) throw new Error(`overview: no tile ${id}`);
+    return thumbnail(t.entry, t.rgba, t.w, t.h, OVERVIEW_THUMB);
+  });
+  const bands = OVERVIEW.map(([section, ids]) => ({ section, items: tiles(ids), row: 0, col: 0 }));
+  let row = 0, col = 0;
+  for (const b of bands) {
+    if (col + b.items.length > OVERVIEW_COLS) [row, col] = [row + 1, 0];
+    [b.row, b.col] = [row, col];
+    col += b.items.length;
+  }
+  const gap = 56, rowGap = 20, pad = 24; // wide columns, tight rows: keeps the sheet near 4:3
+  const tw = bands[0].items[0].w, th = bands[0].items[0].h;
+  const headH = Math.round(head.ascent + head.descent + 6), titleH = Math.round(title.ascent + title.descent + 6);
+  const bandH = headH + titleH + th + rowGap;
+  const W = pad * 2 + OVERVIEW_COLS * tw + (OVERVIEW_COLS - 1) * gap, H = pad * 2 + (row + 1) * bandH - rowGap;
+  const img = new Uint8Array(W * H * 4);
+  for (const b of bands) {
+    const x0 = pad + b.col * (tw + gap), top = pad + b.row * bandH;
+    drawText(img, W, font, head, b.section, x0, top, INK, tw);
+    drawText(img, W, font, head, `/sciviz ${b.section}`, x0 + font.measure(head, b.section) + 18, top, INK2, 2 * tw);
+    b.items.forEach((t, i) => {
+      const x = x0 + i * (tw + gap);
+      drawText(img, W, font, title, t.entry.id, x, top + headH, INK, tw);
+      blit(img, W, t, x, top + headH + titleH);
+    });
+  }
+  Deno.writeFileSync(path, await encodePng(img, W, H));
+}
+
 async function contactSheet(section: string, items: Thumb[], cols: number, path: string): Promise<void> {
   const font = await BitmapFont.load(new URL("assets/", ROOT));
   const title = font.get("bold", 17), desc = font.get("regular", 14), head = font.get("bold", 26);
@@ -178,20 +248,11 @@ async function contactSheet(section: string, items: Thumb[], cols: number, path:
     for (let c = 0; c < cols; c += 1) {
       const n = r * cols + c;
       if (n >= items.length) break;
-      const { entry, rgba, w, h } = items[n];
+      const { entry } = items[n];
       const x = pad + c * (tw + gap);
       drawText(img, W, font, title, entry.id, x, rowTop, INK, tw);
       descs[n].forEach((line, i) => drawText(img, W, font, desc, line, x, rowTop + titleH + i * lineH, INK2, tw));
-      const top = rowTop + textH[r];
-      for (let j = 0; j < h; j += 1) {
-        img.set(rgba.subarray(j * w * 4, (j + 1) * w * 4), ((top + j) * W + x) * 4);
-      }
-      // frame of the cell (faint), so empty space reads as the plot's extent
-      const edge = (o: number) => {
-        if (img[o + 3] === 0) img.set([0x30, 0x36, 0x3d, 255], o);
-      };
-      for (let i = 0; i < w; i += 1) for (const yy of [top, top + h - 1]) edge((yy * W + x + i) * 4);
-      for (let j = 0; j < h; j += 1) for (const xx of [x, x + w - 1]) edge(((top + j) * W + xx) * 4);
+      blit(img, W, items[n], x, rowTop + textH[r]);
     }
     rowTop += textH[r] + th + gap;
   }
@@ -226,7 +287,7 @@ async function cmdRender(args: string[]): Promise<void> {
   const o = parseArgs(args);
   const out = o.out ?? new URL("out", HERE).pathname;
   const t0 = performance.now();
-  const entries = (await loadEntries()).filter((e) => !o.section || e.section === o.section);
+  const entries = [...await loadEntries(), ...SURFACE_ENTRIES].filter((e) => !o.section || e.section === o.section);
   const bySection = new Map<string, Thumb[]>(); // thumbnails only, not the frames
   let failed = 0;
   for (const entry of entries) {
@@ -250,6 +311,11 @@ async function cmdRender(args: string[]): Promise<void> {
       await contactSheet(section, items, o.cols, path);
       console.log(`contact sheet ${path}`);
     }
+  }
+  if (!o.section && !failed) {
+    const path = `${o.sheets ?? DOCS.pathname.replace(/\/$/, "")}/contact_overview.png`;
+    await overviewSheet([...bySection.values()].flat(), path);
+    console.log(`overview sheet ${path}`);
   }
   console.log(`${entries.length - failed}/${entries.length} entries in ${((performance.now() - t0) / 1000).toFixed(1)} s`);
   if (missingGlyphs.size) console.log(`FAIL: drawn as "?" (not in the font atlas): ${[...missingGlyphs].join(" ")}`);

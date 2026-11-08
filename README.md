@@ -55,9 +55,10 @@ Then ask Claude to show you something (“plot the Lorenz attractor”, “show 
 
 | Command | Shows |
 |---|---|
-| `/sciviz [lines\|curves\|complex\|volumes\|scenes]` | that section's contact sheet and entry ids |
+| `/sciviz` | an overview sheet of every section and the section commands |
+| `/sciviz lines\|curves\|complex\|volumes\|scenes\|surfaces` | that section's contact sheet and entry ids |
 | `/sciviz <entry>` | the entry as a live view; partial names work (`lorenz`, `chirp`, `blocks`) |
-| `/sciviz torus\|wave\|sphere\|dini\|breather` | a live NURBS surface (Dini and the sine-Gordon breather are bicubic interpolants of their parametrisations) |
+| `/sciviz torus\|wave\|sphere\|dini\|breather\|teapot` | a live NURBS surface (Dini and the sine-Gordon breather are bicubic interpolants of their parametrisations) |
 
 ### Controls in a live view
 

@@ -75,6 +75,7 @@ const MAX_FRAME_PX = 4096 // ImageSource limit for shm/file frames
 const DRAG_SCALE = 0.55 // resolution while dragging (faster frames); full Retina again on release
 const VIEW_ASPECT = 16 / 10 // pixels, width / height
 const SURFACES = ['wave', 'torus', 'sphere', 'dini', 'breather', 'teapot', 'wave-test']
+const PUBLIC_SURFACES = SURFACES.filter((x) => !x.endsWith('-test'))
 const COLORMAPS = ['viridis', 'magma', 'inferno', 'plasma']
 const COLOR_BY = ['field', 'height', 'gaussian-curvature', 'mean-curvature']
 const FUNCTIONS = ['bumps', 'runge', 'step', 'blocks']
@@ -102,7 +103,7 @@ type Entry = { id: string; section: string; title: string; description: string; 
 let GALLERY = ''
 /** The last live view's size (cells and frame px), so a tool call's first snapshot after a reload is full size. */
 const SIZE_FILE = () => `${denoSearch.home}/.cache/terminal-sciviz/view-size.json`
-const SECTIONS = ['lines', 'curves', 'complex', 'volumes', 'scenes']
+const SECTIONS = ['lines', 'curves', 'complex', 'volumes', 'scenes', 'surfaces']
 
 const KINDS: Record<Kind, { script: string; ctl: Ctl }> = {
   surface: { script: 'surface.ts', ctl: { surface: 'wave', ...HOME, colormap: 'viridis', colorBy: 'field', knotLines: false } },
@@ -917,24 +918,24 @@ async function resolvePaths($: any, options: Record<string, unknown>) {
 }
 
 export const register: Register = (on, options) => {
-  // one command: /sciviz [section] shows a contact sheet, /sciviz <entry> or <surface> opens a live view
+  // one command: /sciviz shows the overview, /sciviz <section> a contact sheet, /sciviz <entry> or <surface> a live view
   on('command.run', { command: 'sciviz' }, async ($, e) => {
     const arg = String((e as any).args ?? '').trim()
     if (SURFACES.includes(arg)) return openView($, e, 'surface', 'surface', SURFACES)
     if (arg && !SECTIONS.includes(arg)) return openEntry($, e)
-    const section = arg || 'lines'
-    const ids = (await entries($)).filter((x) => x.section === section).map((x) => x.id)
-    return { text: `${section}: ${ids.join('  ')}` }
+    if (!arg) return { text: SECTIONS.map((x) => `/sciviz ${x}`).join('  ') }
+    const ids = arg === 'surfaces' ? PUBLIC_SURFACES : (await entries($)).filter((x) => x.section === arg).map((x) => x.id)
+    return { text: `${arg}: ${ids.join('  ')}` }
   })
 
   on('ui.render', { component: 'CommandOutput' }, async ($, e, next) => {
     const command = (e.props as any).command
     if (e.surface !== 'terminal') return next(e)
-    if (command === 'sciviz' && SECTIONS.includes(String((e.props as any).args ?? '').trim() || 'lines')) { // the section's contact sheet, then its entry ids
+    if (command === 'sciviz' && ['', ...SECTIONS].includes(String((e.props as any).args ?? '').trim())) { // the overview or section's contact sheet, then its commands or ids
       const { Box, Image, Text } = $.ui.resolve(e) as any
-      const section = String((e.props as any).args ?? '').trim() || 'lines'
+      const section = String((e.props as any).args ?? '').trim() || 'overview'
       const png = `${ROOT}/docs/contact_${section}.png`
-      if (!SECTIONS.includes(section) || !(await $.fs.exists(png))) return next(e)
+      if (!(await $.fs.exists(png))) return next(e)
       const cols = Math.max(20, (e.viewport?.columns ?? 100) - RESULT_INDENT)
       const { base64 } = await $.fs.read(png, { as: 'bytes' })
       const hd = new DataView(decodeBase64(base64.slice(0, 32)).buffer)
@@ -1066,7 +1067,7 @@ export const register: Register = (on, options) => {
 
   on('session.start', async ($, e, next) => {
     await resolvePaths($, options ?? {})
-    await $.command.register({ name: 'sciviz', description: `Inline WebGPU views: /sciviz [${SECTIONS.join('|')}] (contact sheet), /sciviz <entry> (live view, e.g. lorenz, chirp, blocks), /sciviz ${SURFACES.filter((x) => !x.endsWith('-test')).join('|')} (NURBS surface)` })
+    await $.command.register({ name: 'sciviz', description: `Inline WebGPU views: /sciviz (overview), /sciviz ${SECTIONS.join('|')} (contact sheet), /sciviz <entry> (live view, e.g. lorenz, chirp, blocks), /sciviz ${PUBLIC_SURFACES.join('|')} (NURBS surface)` })
     const ids = (await entries($)).map((x) => x.id)
     await $.tool.register({
       name: 'gallery_open',
