@@ -6,13 +6,17 @@
  *    bands, the breathing Gaussian) at random voxels:
  *    max |gpu − ref| / max |ref|, and the median relative error of voxels above 1% of the max.
  * 2. GPU marching cubes against the CPU reference (lib/marching_cubes.ts) at the same levels, on
- *    the same (read-back) f32 voxels: triangle counts and surface areas (index space).
+ *    the same (read-back) f32 voxels: triangle counts and surface areas (index space); and over
+ *    the active bricks only against every cell: the same triangles.
+ * 3. Files: .npy headers, non-finite values, slices read on demand (lib/stack.ts) against the
+ *    whole file, short reads, a changed file read again, the halved preview, NaN validity.
  *
  *   deno run -A tools/check_volume.ts [--voxels 300]
  */
 
 import { marchingCubes } from "../lib/marching_cubes.ts";
 import { axisValues, DEFAULTS, readStack, type VolumeMeta, VolumePlot, type VolumeSpec, volumeMeta } from "../volume.ts";
+import { downsample, prepareSlice, readAt, readSlice, StackReader } from "../lib/stack.ts";
 import { renderOnce } from "../lib/serve.ts";
 
 const fact = (k: number) => { let f = 1; for (let i = 2; i <= k; i += 1) f *= i; return f; };
@@ -122,6 +126,7 @@ for (const [spec, slice] of specs) {
 }
 
 console.log("2. isosurfaces (GPU marching cubes vs CPU reference, same f32 voxels)");
+let badMc = 0;
 const cases: [string, VolumeSpec, number[] | null][] = [
   ["orbital_iso", { dataset: "hydrogen", n: 3, l: 2, m: 1, quantity: "psi" }, [-0.01, 0.01]],
   ["fermi_surface", { dataset: "fermi", size: 64 }, null],
@@ -139,10 +144,27 @@ for (const [name, spec, levels] of cases) {
     const [ga, ca] = [area(gpu), area(cpu.positions, cpu.indices)];
     console.log(`  ${name} level ${stats[i].level}: triangles GPU ${stats[i].triangles}, CPU ${cpu.indices.length / 3} (diff ${stats[i].triangles - cpu.indices.length / 3}); area GPU ${ga.toFixed(3)}, CPU ${ca.toFixed(3)} (rel diff ${((ga - ca) / ca).toExponential(2)}); CPU vertices ${cpu.positions.length / 3} (welded); GPU ${stats[i].ms} ms, CPU ${cpuMs.toFixed(1)} ms`);
   }
+  // every cell (fullMarch) against the active bricks': the same triangles, in another order
+  const tris = async () => {
+    const out: string[] = [];
+    for (let i = 0; i < stats.length; i += 1) {
+      const p = await plot.isoPositions(i);
+      for (let t = 0; t < p.length; t += 9) out.push(Array.from(p.subarray(t, t + 9)).join(","));
+    }
+    return out.sort().join(";");
+  };
+  const bricked = await tris();
+  plot.fullMarch = true;
+  await renderOnce(plot, { ...DEFAULTS, volume: spec, isoLevels: levels, width: 64, height: 48 } as never);
+  const full = await tris();
+  plot.fullMarch = false;
+  await renderOnce(plot, { ...DEFAULTS, volume: spec, isoLevels: levels, width: 64, height: 48 } as never); // the bricked meshes current again
+  if (bricked !== full) badMc += 1;
+  console.log(`  ${bricked === full ? "ok  " : "FAIL"} ${name}: active bricks' triangles = every cell's (${full.split(";").length} triangles)`);
 }
 
-console.log("3. files: .npy headers, non-finite values, slice values, NaN validity");
-let bad = 0;
+console.log("3. files: .npy headers, non-finite values, slices on demand, slice values, NaN validity");
+let bad = badMc;
 const ok = (name: string, f: () => unknown) => {
   let r: unknown;
   try { r = f(); } catch (err) { r = `threw ${(err as Error).message}`; }
@@ -150,22 +172,94 @@ const ok = (name: string, f: () => unknown) => {
   console.log(`  ${r === true ? "ok  " : "FAIL"} ${name}${r === true ? "" : `: ${r}`}`);
 };
 const dir = Deno.makeTempDirSync();
-const npy = (name: string, header: string, values: number[]) => {
+const npy = (name: string, header: string, values: ArrayLike<number>, wide = false) => {
   const h = header + " ".repeat(63 - ((10 + header.length) % 64)) + "\n";
-  const b = new Uint8Array(10 + h.length + values.length * 4);
+  const b = new Uint8Array(10 + h.length + values.length * (wide ? 8 : 4));
   b.set([0x93, 78, 85, 77, 80, 89, 1, 0, h.length & 255, h.length >> 8]);
   b.set(new TextEncoder().encode(h), 10);
-  new Float32Array(b.buffer, 10 + h.length).set(values);
+  new (wide ? Float64Array : Float32Array)(b.buffer, 10 + h.length).set(values);
   Deno.writeFileSync(`${dir}/${name}`, b);
   return { dataset: "file" as const, path: `${dir}/${name}` };
 };
 const eight = [1, 2, 3, 4, 5, 6, 7, 8];
 const throwsRe = (f: () => unknown, re: RegExp) => { try { f(); } catch (e) { return re.test((e as Error).message) || (e as Error).message; } return "did not throw"; };
-ok("double-quoted header", () => readStack(npy("dq.npy", `{"descr": "<f4", "fortran_order": False, "shape": (2, 2, 2)}`, eight)).data[7] === 8);
+ok("double-quoted header", () => readSlice(readStack(npy("dq.npy", `{"descr": "<f4", "fortran_order": False, "shape": (2, 2, 2)}`, eight)), 0)[7] === 8);
 ok("mixed quotes, fortran_order True rejected", () => throwsRe(() => readStack(npy("fq.npy", `{'descr': '<f4', "fortran_order": True, 'shape': (2, 2, 2), }`, eight)), /fortran_order/));
 ok("1-tuple shape (5,): not 3D", () => throwsRe(() => readStack(npy("one.npy", `{'descr': '<f4', 'fortran_order': False, 'shape': (5,), }`, [1, 2, 3, 4, 5])), /shape must be 3 or 4/));
 ok("a missing key", () => throwsRe(() => readStack(npy("mk.npy", `{'descr': '<f4', 'shape': (2, 2, 2), }`, eight)), /without descr, fortran_order and shape/));
-ok("±∞ rejected at its index", () => throwsRe(() => readStack(npy("inf.npy", `{'descr': '<f4', 'fortran_order': False, 'shape': (2, 2, 2), }`, [1, 2, 3, Infinity, 5, 6, 7, 8])), /flat index 3/));
+const prepared = (spec: { path: string }, k: number) => { const st = readStack({ dataset: "file", ...spec }); return prepareSlice(readSlice(st, k), st, k); };
+ok("±∞ rejected at its index", () => throwsRe(() => prepared(npy("inf.npy", `{'descr': '<f4', 'fortran_order': False, 'shape': (2, 2, 2), }`, [1, 2, 3, Infinity, 5, 6, 7, 8]), 0), /flat index 3/));
+ok("±∞ in slice 1 of a stack: its flat index in the file", () => throwsRe(() => prepared(npy("inf4.npy", `{'descr': '<f4', 'fortran_order': False, 'shape': (2, 2, 2, 2), }`, [...eight, 1, 2, -Infinity, 4, 5, 6, 7, 8]), 1), /value -Infinity at flat index 10/));
+ok("f64 beyond f32 rejected with its value", () => throwsRe(() => prepared(npy("big64.npy", `{'descr': '<f8', 'fortran_order': False, 'shape': (2, 2, 2), }`, [1, 2, 3, 4, 1e300, 6, 7, 8], true), 0), /value 1e\+300 at flat index 4/));
+// Slices read on demand = the whole file read at once (f32 and f64, NaN kept)
+const ref = Array.from({ length: 5 * 4 * 6 * 8 }, (_, i) => (i % 7 === 3 ? NaN : Math.sin(i) * 1e3));
+for (const wide of [false, true]) {
+  const spec = npy(`stack${wide ? 64 : 32}.npy`, `{'descr': '<f${wide ? 8 : 4}', 'fortran_order': False, 'shape': (5, 4, 6, 8), }`, ref, wide);
+  const st = readStack(spec);
+  const bytes = Deno.readFileSync(spec.path);
+  const whole = Float32Array.from(new (wide ? Float64Array : Float32Array)(bytes.buffer.slice(st.offset)));
+  ok(`slices on demand = the whole file (${wide ? "f64" : "f32"}, header ${st.offset} bytes)`, () => {
+    for (let k = 0; k < 5; k += 1) {
+      const s = readSlice(st, k), w = whole.subarray(k * 192, (k + 1) * 192);
+      if (!s.every((v, i) => Object.is(v, w[i]))) return `slice ${k} differs`;
+    }
+    return true;
+  });
+}
+ok("short reads continued; reading past the end throws", () => {
+  const data = Uint8Array.from({ length: 100 }, (_, i) => i);
+  let at = 0;
+  const file = { seekSync: (o: number) => (at = o), readSync: (b: Uint8Array) => { const n = Math.min(7, b.length, data.length - at); if (n <= 0) return null; b.set(data.subarray(at, at + n)); at += n; return n; } };
+  const out = new Uint8Array(30);
+  readAt(file as unknown as Deno.FsFile, 13, out);
+  if (!out.every((v, i) => v === 13 + i)) return `got ${out}`;
+  return throwsRe(() => readAt(file as unknown as Deno.FsFile, 90, new Uint8Array(20)), /end of file at byte 100/);
+});
+ok("a truncated file: its size checked", () => {
+  const spec = npy("trunc.npy", `{'descr': '<f4', 'fortran_order': False, 'shape': (2, 2, 2), }`, eight);
+  Deno.truncateSync(spec.path, Deno.statSync(spec.path).size - 4);
+  return throwsRe(() => readStack(spec), /28 bytes of data/);
+});
+{ // a changed file (same size, its mtime moved): read again, through the renderer (the worker)
+  const spec = npy("change.npy", `{'descr': '<f4', 'fortran_order': False, 'shape': (2, 2, 2, 2), }`, [...eight, ...eight.map((v) => v * 10)]);
+  const shown = async () => { await renderOnce(plot, { ...DEFAULTS, volume: spec, slice: 1, width: 64, height: 48 } as never); return plot.volumeData!.values[7]; };
+  const before = await shown();
+  npy("change.npy", `{'descr': '<f4', 'fortran_order': False, 'shape': (2, 2, 2, 2), }`, [...eight, ...eight.map((v) => v * 100)]);
+  Deno.utimeSync(spec.path, new Date(), new Date(Date.now() + 5000));
+  const after = await shown();
+  ok("a changed file read again (its slices and domain)", () => (before === 80 && after === 800) || `slice 1 [7]: ${before}, then ${after}`);
+}
+{ // one file read two ways (raw f64, then the same bytes as f32): jobs and domains by layout
+  const path = `${dir}/two.bin`;
+  Deno.writeFileSync(path, new Uint8Array(Float64Array.from(eight).buffer));
+  const f64 = { dataset: "file" as const, path, shape: [2, 2, 2], dtype: "f64" as const };
+  const f32 = { dataset: "file" as const, path, shape: [2, 2, 4], dtype: "f32" as const };
+  const reader = new StackReader();
+  const pre = reader.slice(readStack(f32), 0, { prefetch: true }); // running when the f64 request comes
+  const got = await reader.slice(readStack(f64), 0);
+  await pre.catch(() => {});
+  ok("a pending prefetch of another layout isn't shared", () => (got.values.length === 8 && got.values[7] === 8) || `got ${got.values}`);
+  const domain = async (volume: object) => ((await renderOnce(plot, { ...DEFAULTS, volume, width: 64, height: 48 } as never)).state as { dataDomain: number[] }).dataDomain;
+  const [d64, d32] = [await domain(f64), await domain(f32)];
+  ok("the whole-stack domain by layout (f64 [1, 8], the same bytes as f32 their own)", () => (d64.join() === "1,8" && d32.join() !== "1,8" && d32[0] === 0) || `f64 ${d64}, f32 ${d32}`);
+}
+{ // the renderer's slice (worker, NaN restored for volumeData) = the file's; the halved preview
+  const spec = npy("nan4.npy", `{'descr': '<f4', 'fortran_order': False, 'shape': (5, 4, 6, 8), }`, ref);
+  await renderOnce(plot, { ...DEFAULTS, volume: spec, slice: 3, width: 64, height: 48 } as never);
+  const st = readStack(spec);
+  ok("renderer's slice 3 = the file's (NaN at the same voxels)", () => plot.volumeData!.values.every((v, i) => Object.is(v, readSlice(st, 3)[i])) || "differs");
+  ok("preview: means of the valid voxels of each 2³, valid with at least 4", () => {
+    const src = readSlice(st, 2), d = downsample(readSlice(st, 2), st, 2);
+    for (let o = 0; o < 2 * 3 * 4; o += 1) {
+      const [x, y, z] = [o % 4, Math.floor(o / 4) % 3, Math.floor(o / 12)];
+      const vals = [0, 1].flatMap((dz) => [0, 1].flatMap((dy) => [0, 1].map((dx) => src[((2 * z + dz) * 6 + 2 * y + dy) * 8 + 2 * x + dx]))).filter((v) => v === v);
+      const valid = vals.length >= 4;
+      if (valid !== (!d.valid || d.valid[o] === 255)) return `validity at ${o}`;
+      if (valid && Math.abs(d.values[o] - vals.reduce((a, b) => a + b, 0) / vals.length) > 1e-3) return `value at ${o}`;
+    }
+    return true;
+  });
+}
 const big = npy("big.npy", `{'descr': '<f4', 'fortran_order': False, 'shape': (3, 2, 2, 2), }`, Array.from({ length: 24 }, (_, i) => i));
 await renderOnce(plot, { ...DEFAULTS, volume: { ...big, axes: [{ lo: 0, hi: 1 }, { lo: 0, hi: 1 }, { lo: 0, hi: 1 }, { lo: 1e12, hi: 1e12 + 2 }] }, slice: 2, width: 64, height: 48 } as never);
 ok("slice values at full precision (1e12 … 1e12 + 2): slice 2 shown", () => plot.volumeData!.values[0] === 16 || `first value ${plot.volumeData!.values[0]}`);

@@ -5,18 +5,22 @@
  *   or `breathing`, `tight_binding`, `fermi`), by a compute shader writing straight into an r32float 3D
  *   texture (filtered: `float32-filterable`), cached by spec and slice; or read from a file
  *   (`{dataset: "file", path, shape?, dtype?, axes?}`: `.npy`, or raw little-endian f32 / f64 with
- *   `shape`), the whole stack kept on the CPU (as f32), one slice uploaded at a time, re-read when
- *   the file changes; NaN voxels are transparent (no colour, opacity, isosurface or domain): uploaded
- *   as 0 with a validity texture (r8unorm, 1 valid), a sample valid only where every voxel it
- *   filters is (validity ≥ 1 − 1e-3), a marching-cubes cell only with 8 valid corners;
+ *   `shape`), a slice at a time by a worker (lib/stack.ts: the header read, slices on demand, the
+ *   next one in a drag's direction prefetched, a few kept), uploaded into reused textures, read
+ *   again when the file changes (mtime, size, inode); the domain over every slice scanned once,
+ *   unless `domain` is given; while interacting, large slices halved (a preview), isosurfaces
+ *   left to the settled frame; NaN voxels are transparent (no colour, opacity, isosurface or
+ *   domain): uploaded as 0 with a validity texture (r8unorm, 1 valid), a sample valid only where
+ *   every voxel it filters is (validity ≥ 1 − 1e-3), a marching-cubes cell only with 8 valid corners;
  * - 4D stacks: the leading dimension is the `slice`; `sliders: {slice: {}}` (files: by default) draws
  *   an in-frame slider over the slice axis' values (lib/sliders.ts), set by the mod as `sliderValues`;
  * - a single-pass ray marcher: DVR / MIP / Iso modes, opacity ramp above a threshold (of the
  *   distance from the centre value for diverging colouring, so values near it stay clear) with
- *   sampling-rate correction, colours over [value at threshold, max], gradient shading, jitter,
+ *   sampling-rate correction (opacity per a fixed length of the box: alike at every resolution), colours over [value at threshold, max], gradient shading, jitter,
  *   non-uniform axes (lookup tables of voxel edges and centres), rays stopped at opaque
  *   isosurfaces (a depth pre-pass); colour maps sampled as a nearest 256-texel texture;
- * - isosurfaces by marching cubes in compute shaders (count, prefix sum, emit), with the case
+ * - isosurfaces by marching cubes in compute shaders (count, prefix sum, emit; over the bricks of
+ *   8³ cells whose value range straddles the level, cached per slice and level), with the case
  *   triangulations of lib/marching_cubes.ts (face walks, asymptotic decider, centroid fans), its
  *   snapping and degenerate-triangle rule, normals from central differences; lit as a standard
  *   PBR material (roughness 0.55, metalness 0.05) under a headlight (2.4) and ambient light (0.35),
@@ -69,6 +73,7 @@ import { cameraBasis, fitAngles, fitView, screenRect as pixelRect, type Vec3 } f
 import { makeReadBuffer, rowBytes } from "./lib/gpu.ts";
 import { BitmapFont, type FontSize, FRAME_FORMAT, OverlayRenderer, premul, Quads, type Rgba, ROOT_HOT, rootSlider, type RootSlider, rootSliderHeight } from "./lib/overlay.ts";
 import { main, type Pending, type Renderer as ServeRenderer } from "./lib/serve.ts";
+import { fileVersion, readAt, type StackFile, stackKey, StackReader } from "./lib/stack.ts";
 import { drawSliders, nearestValue, resolveSliders, type Slider, type SliderDef, sliderHeight } from "./lib/sliders.ts";
 
 const INK = "#c9d1d9", INK2 = "#8b949e", HOVER_RING = "#e6edf3";
@@ -80,6 +85,10 @@ const SAMPLES = 4;
 const DEPTH = "depth24plus";
 const ISO_COLORS = ["#4cc9f0", "#f72585", "#90be6d", "#f9c74f", "#b388ff"]; // one per level, cycled
 
+const BRICK = 8; // marching cubes: cells a side of the bricks whose value ranges are checked first
+/** Bricks along x, y, z of a `[z, y, x]` shape: cells (n − 1) over BRICK. */
+const brickDims = ([nz, ny, nx]: number[]) => [nx, ny, nz].map((n) => Math.ceil((n - 1) / BRICK));
+const OPACITY_VOXELS = 56; // DVR opacity is per 1/56 of the box's largest side (a voxel of the default 56³ orbital), at any resolution
 const VALID_MIN = 1 - 1e-3; // filtered validity of a sample whose voxels are all valid
 const DIVERGING = new Set(["BrBG", "PRGn", "PiYG", "PuOr", "RdBu", "RdGy", "RdYlBu", "RdYlGn", "Spectral"]);
 
@@ -111,38 +120,39 @@ export interface VolumeMeta {
 
 // --- Data: files ------------------------------------------------------------------------------
 
-/** A file's voxels: every slice, [slice][z][y][x] as f32. */
-interface Stack { path: string; mtime: number; version: string; shape: [number, number, number]; slices: number; data: Float32Array; readMs: number }
+/** A file's stack: its header (lib/stack.ts reads slices on demand). */
+type Stack = StackFile;
 const stacks = new Map<string, Stack>();
 const HERE = new URL("./", import.meta.url).pathname;
 const filePath = (p: string) => (p.startsWith("/") ? p : HERE + p); // relative: to deno/ (the gallery's assets)
-const mtimeOf = (path: string) => { try { return Deno.statSync(path).mtime?.getTime() ?? 0; } catch { return -1; } };
-/** What a cached load depends on beyond the spec: the file's modification time. */
+const versionOf = (path: string) => { try { return fileVersion(Deno.statSync(path)); } catch { return null; } };
 
-/** The stack of a file spec (once per path, shape, dtype and mtime): `.npy` (its header gives
- * shape and dtype: little-endian f4 / f8, C order), else raw little-endian values (`.f32`, `.bin`,
- * `.raw`; `.f64`), shape from the spec. */
+/** The stack of a file spec (once per path, shape, dtype and version: mtime, size, inode): `.npy`
+ * (its header gives shape and dtype: little-endian f4 / f8, C order), else raw little-endian
+ * values (`.f32`, `.bin`, `.raw`; `.f64`), shape from the spec. Only the header is read. */
 export function readStack(spec: Extract<VolumeSpec, { dataset: "file" }>): Stack {
   if (typeof spec.path !== "string" || !spec.path) throw new Error("file volume: give path (a .npy, or raw .f32 / .bin with shape)");
   if (spec.nan !== undefined && spec.nan !== "transparent") throw new Error(`file volume: nan must be "transparent" (got ${JSON.stringify(spec.nan)})`);
   const path = filePath(spec.path);
   const ext = (/\.([a-z0-9]+)$/i.exec(path)?.[1] ?? "").toLowerCase();
   if (["nc", "nc4", "cdf", "h5", "hdf5", "he5", "hdf"].includes(ext)) throw new Error(`file volume ${path}: netCDF / HDF5 are not read yet; write the array as .npy or raw little-endian .f32 (with shape)`);
-  const mtime = mtimeOf(path);
-  if (mtime < 0) throw new Error(`file volume: no such file ${path}`);
+  const version = versionOf(path);
+  if (version === null) throw new Error(`file volume: no such file ${path}`);
   const key = JSON.stringify([path, spec.shape, spec.dtype]);
   const hit = stacks.get(key);
-  if (hit && hit.mtime === mtime) return hit;
-  const t0 = performance.now();
-  const bytes = Deno.readFileSync(path);
+  if (hit && hit.version === version) return hit;
+  using file = Deno.openSync(path);
+  const info = file.statSync();
   let shape: number[], dtype: "f32" | "f64", offset = 0;
   if (ext === "npy") {
-    if (bytes[0] !== 0x93 || String.fromCharCode(...bytes.subarray(1, 6)) !== "NUMPY") throw new Error(`${path}: not a .npy file`);
+    const head = (at: number, n: number) => { const b = new Uint8Array(n); readAt(file, at, b); return b; };
+    const bytes = head(0, Math.min(info.size, 12));
+    if (bytes[0] !== 0x93 || String.fromCharCode(...bytes.subarray(1, 6)) !== "NUMPY" || bytes.length < 12) throw new Error(`${path}: not a .npy file`);
     const major = bytes[6];
-    const dv = new DataView(bytes.buffer, bytes.byteOffset);
+    const dv = new DataView(bytes.buffer);
     const hlen = major === 1 ? dv.getUint16(8, true) : dv.getUint32(8, true);
     offset = (major === 1 ? 10 : 12) + hlen;
-    const header = new TextDecoder().decode(bytes.subarray(major === 1 ? 10 : 12, offset));
+    const header = new TextDecoder().decode(head(major === 1 ? 10 : 12, hlen));
     // the header dict: keys and descr in either quote style, shape a tuple ("(5,)" too)
     const descr = /["']descr["']\s*:\s*["']([^"']+)["']/.exec(header)?.[1];
     const fortran = /["']fortran_order["']\s*:\s*(True|False)\b/.exec(header)?.[1];
@@ -162,15 +172,8 @@ export function readStack(spec: Extract<VolumeSpec, { dataset: "file" }>): Stack
   const [ns, nz, ny, nx] = shape;
   if ([nz, ny, nx].some((n) => n < 2 || n > 1024)) throw new Error(`file volume ${path}: z, y, x sizes must be in [2, 1024], got [${shape.slice(1)}]`);
   const count = ns * nz * ny * nx, size = dtype === "f64" ? 8 : 4;
-  if (bytes.length - offset !== count * size) throw new Error(`file volume ${path}: ${bytes.length - offset} bytes of data, shape [${shape}] of ${dtype} needs ${count * size}`);
-  const raw = (offset + bytes.byteOffset) % size ? bytes.slice(offset).buffer : bytes.buffer;
-  const at = raw === bytes.buffer ? bytes.byteOffset + offset : 0;
-  const data = dtype === "f64" ? Float32Array.from(new Float64Array(raw, at, count)) : new Float32Array(raw, at, count);
-  for (let i = 0; i < count; i += 1) { // NaN is allowed (transparent); ±∞, or beyond f32 (|v| > 3.4e38), not
-    const v = data[i];
-    if (v === Infinity || v === -Infinity) throw new Error(`file volume ${path}: value ${dtype === "f64" ? new Float64Array(raw, at, count)[i] : v} at flat index ${i} is not a finite f32 (|v| ≤ 3.4e38); use NaN for missing values`);
-  }
-  const st: Stack = { path, mtime, version: `${mtime}:${bytes.length}`, shape: [nz, ny, nx], slices: ns, data, readMs: performance.now() - t0 };
+  if (info.size - offset !== count * size) throw new Error(`file volume ${path}: ${info.size - offset} bytes of data, shape [${shape}] of ${dtype} needs ${count * size}`);
+  const st: Stack = { path, version: fileVersion(info), offset, dtype, shape: [nz, ny, nx], slices: ns };
   for (const [k, v] of stacks) if (v.path === path) stacks.delete(k); // one version per file
   stacks.set(key, st);
   return st;
@@ -373,7 +376,8 @@ const GEN_WGSL = /* wgsl */ `
 const MC_WGSL = /* wgsl */ `
   struct M {
     dims: vec4u, // nx, ny, nz, scale (0 linear, 1 log, 2 symlog, 3 sqrt)
-    level: f32, symlogConstant: f32, cells: u32, pad: u32,
+    level: f32, symlogConstant: f32, cells: u32, bricked: u32, // bricked: cells are those of the active bricks
+    bricks: vec4u, // bricks along x, y, z (BRICK cells a side)
   }
   @group(0) @binding(0) var<uniform> u: M;
   @group(0) @binding(1) var data: texture_3d<f32>;
@@ -384,6 +388,7 @@ const MC_WGSL = /* wgsl */ `
   @group(0) @binding(6) var<storage, read_write> counts: array<u32>; // per cell, then offsets
   @group(0) @binding(7) var<storage, read_write> verts: array<vec4f>; // position, normal per vertex
   @group(0) @binding(8) var validity: texture_3d<f32>; // 1 valid, 0 NaN (1 × 1 × 1: all valid)
+  @group(0) @binding(9) var<storage, read> activeBricks: array<u32>; // bricks straddling the level
 
   const EDGES = array<vec2u, 12>(
     vec2u(0, 1), vec2u(2, 3), vec2u(4, 5), vec2u(6, 7),
@@ -490,7 +495,14 @@ const MC_WGSL = /* wgsl */ `
     if (index >= u.cells) { return; }
     let cx = u.dims.x - 1u;
     let cy = u.dims.y - 1u;
-    let cell = vec3u(index % cx, (index / cx) % cy, index / (cx * cy));
+    var cell = vec3u(index % cx, (index / cx) % cy, index / (cx * cy));
+    if (u.bricked != 0u) {
+      let b = activeBricks[index / ${BRICK ** 3}u];
+      let l = index % ${BRICK ** 3}u;
+      let brick = vec3u(b % u.bricks.x, (b / u.bricks.x) % u.bricks.y, b / (u.bricks.x * u.bricks.y));
+      cell = brick * ${BRICK}u + vec3u(l % ${BRICK}u, (l / ${BRICK}u) % ${BRICK}u, l / ${BRICK ** 2}u);
+      if (any(cell >= u.dims.xyz - 1u)) { if (!emit) { counts[index] = 0u; } return; }
+    }
     var cv: array<f32, 8>;
     var caseIndex = 0u;
     for (var n = 0u; n < 8u; n++) {
@@ -558,6 +570,28 @@ const MC_WGSL = /* wgsl */ `
       }
     }
     if (!emit) { counts[index] = kept; }
+  }
+
+  // Min and max of the valid values of each brick: its cells' corners, voxels
+  // [BRICK b, min(BRICK b + BRICK, n - 1)] along each axis (max < min: none valid)
+  @group(0) @binding(10) var<storage, read_write> ranges: array<vec2f>;
+  @compute @workgroup_size(64)
+  fn brickRanges(@builtin(global_invocation_id) id: vec3u, @builtin(num_workgroups) nw: vec3u) {
+    let b = id.x + id.y * nw.x * 64u;
+    if (b >= u.bricks.x * u.bricks.y * u.bricks.z) { return; }
+    let lo = vec3u(b % u.bricks.x, (b / u.bricks.x) % u.bricks.y, b / (u.bricks.x * u.bricks.y)) * ${BRICK}u;
+    let hi = min(lo + ${BRICK}u, u.dims.xyz - 1u);
+    var r = vec2f(3.4e38, -3.4e38);
+    for (var z = lo.z; z <= hi.z; z++) {
+      for (var y = lo.y; y <= hi.y; y++) {
+        for (var x = lo.x; x <= hi.x; x++) {
+          let p = vec3u(x, y, z);
+          let v = value(p);
+          if (v == v && validAt(p)) { r = vec2f(min(r.x, v), max(r.y, v)); }
+        }
+      }
+    }
+    ranges[b] = r;
   }
 
   @compute @workgroup_size(64)
@@ -648,6 +682,7 @@ const VOLUME_WGSL = /* wgsl */ `
     p3: vec4f, // scale (0 linear, 1 log, 2 symlog, 3 sqrt), lookup offsets x, y, z (-1: none)
     size: vec4f, // target width, height; diverging: 1 / largest distance from the centre (0: not), centre
     depthScale: vec4f, // surface depth texels per target pixel (xy): 1, or about 2 at half resolution; z: 1 for forward-difference gradients
+    box: vec4f, // box size (largest side 1), w: 1 / the opacity's reference length (box units)
   }
   @group(0) @binding(0) var<uniform> u: U;
   @group(0) @binding(1) var volume: texture_3d<f32>;
@@ -849,7 +884,7 @@ const VOLUME_WGSL = /* wgsl */ `
       return vec4f(thresholdColor(pow(maxValue, 1.0 / u.p0.z)), 1.0);
     }
     if (mode == 1u) { // DVR
-      let alphaExponent = dt * length(voxelDir);
+      let alphaExponent = dt * length(dir * u.box.xyz) * u.box.w; // physical step over the reference length: alike at every resolution
       var acc = vec4f(0.0);
       let diverging = u.size.z > 0.0;
       for (var i = 0; i < steps; i++) {
@@ -1023,7 +1058,7 @@ export const DEFAULTS = {
   opacity: 0.25,
   threshold: 0.1,
   quality: "medium" as "low" | "medium" | "high",
-  interacting: false, // while the camera moves: half the samples, half resolution, cheaper shading
+  interacting: false, // while the camera or a slider moves: half the samples, half resolution, cheaper shading; no new isosurfaces, large file slices halved
   showVolume: true,
   isoLevels: null as number[] | null, // default: generator's (Fermi level)
   isoColors: "levels" as "levels" | "colormap", // a colour per level, or the level through the colour map
@@ -1046,14 +1081,36 @@ interface Data {
   key: string;
   meta: VolumeMeta;
   slice: number;
-  texture: GPUTexture;
-  validity?: GPUTexture; // of a file slice with NaN
-  values: Float32Array; // read back: domain, hover, Fermi level
+  texture?: GPUTexture; // a generated slice's own; a file's slice is uploaded into a pooled one when used (`bind`)
+  values: Float32Array; // read back, or a file's (NaN as 0 where `valid` is 0): domain, hover, Fermi level
+  valid?: Uint8Array; // of a file slice with NaN: 255 valid, 0 NaN
+  bricks?: Float32Array; // min, max of the valid values per marching-cubes brick (made when first extracting)
   dataDomain: [number, number];
   fermi?: number;
+  readMs?: number; // a file slice's read and preparation (worker)
+  dims?: [number, number, number]; // a preview's (halved) texture size, z, y, x: else the meta's shape
 }
 
-interface IsoMesh { level: number; key: string; buffer?: GPUBuffer; triangles: number; ms: number }
+const GPU_SLICES = 2; // file slices kept uploaded (textures reused)
+const FILE_CACHE_BYTES = 2 ** 30; // slices kept read (CPU bytes; the newest kept whatever its size)
+const PREVIEW_VOXELS = 2 ** 23; // a file's slices this large (even sizes) are halved while interacting
+
+/** Data domain of a scale from value ranges (lib/stack.ts `SliceData.stats`). */
+function statsDomain(stats: Float64Array, type: ScaleType): [number, number] | null {
+  const i = type === "log" ? 2 : type === "sqrt" ? 4 : 0;
+  return stats[i] <= stats[i + 1] ? [stats[i], stats[i + 1]] : null;
+}
+
+interface IsoMesh { level: number; key: string; buffer?: GPUBuffer; triangles: number; ms: number; deferred?: boolean }
+const MESH_CACHE = 64;
+
+/** Marching cubes' scale (0 linear, 1 log, 2 symlog, 3 sqrt) and symlog constant: what the
+ * geometry depends on (a root or gamma colour scale does not move it). */
+function mcScale(vis: VisScale): [number, number] {
+  const kind = Array.isArray(vis) ? (vis[0] === "symlog" ? 2 : 0) : vis === "log" ? 1 : vis === "sqrt" ? 3 : vis === "symlog" ? 2 : 0;
+  return [kind, kind === 2 && Array.isArray(vis) ? vis[1] : 1];
+}
+const meshKey = (data: Data, level: number, vis: VisScale, full: boolean) => `${data.key}|${level}|${mcScale(vis)}${full ? "|full" : ""}`;
 
 interface Label { text: string; at: Vec3; outward: Vec3; priority: number; axis: boolean }
 
@@ -1096,6 +1153,7 @@ export class VolumePlot implements ServeRenderer<Control> {
   private readonly frameReads: GPUBuffer[] = [];
   private readonly genPipeline: GPUComputePipeline;
   private readonly countPipeline: GPUComputePipeline;
+  private readonly brickPipeline: GPUComputePipeline;
   private readonly emitPipeline: GPUComputePipeline;
   private readonly scanPipeline: GPUComputePipeline;
   private readonly addPipeline: GPUComputePipeline;
@@ -1110,10 +1168,16 @@ export class VolumePlot implements ServeRenderer<Control> {
   private readonly lineUniforms: GPUBuffer;
   private isoUniforms: GPUBuffer[] = [];
   private data?: Data;
-  private readonly dataCache = new Map<string, Promise<Data>>();
+  private readonly dataCache = new Map<string, Promise<Data>>(); // least recently used first
+  private readonly dataHeld = new Map<string, Data>(); // entries read: what they hold
   /** Data domain over every slice of a spec (and scale), apart from the slice textures. */
   private readonly domainCache = new Map<string, Promise<[number, number] | null>>();
-  private meshes: IsoMesh[] = [];
+  private readonly statsCache = new Map<string, Promise<Float64Array>>(); // of a file's whole stack, by `stackKey`
+  private readonly fileVersions = new Map<string, string>(); // path: the version read
+  private readonly reader = new StackReader();
+  private slots: { key: string; texture: GPUTexture; validity?: GPUTexture }[] = []; // uploaded file slices, least recently used first
+  private meshes: IsoMesh[] = []; // of the last frame, one per level
+  private readonly meshCache = new Map<string, IsoMesh>(); // by data, level and scale; least recently used first
   private colorKey?: string;
   private colorBuffer?: GPUBuffer;
   private lookupBuffer?: GPUBuffer;
@@ -1126,6 +1190,7 @@ export class VolumePlot implements ServeRenderer<Control> {
   private sliceDef?: SliderDef; // the slice slider's value and range
   private sliders: Slider[] = []; // as drawn
   private uploadMs = 0; // of the last file slice
+  fullMarch = false; // marching cubes over every cell, not only the active bricks' (checks)
   private readonly allValid: GPUTexture; // 1 × 1 × 1 validity of data without NaN
   // Of the last frame, for the hover read-out and state.json
   content: [number, number, number, number] | null = null; // the box's pixels, for the client (state)
@@ -1145,6 +1210,7 @@ export class VolumePlot implements ServeRenderer<Control> {
     const gen = mod(GEN_WGSL), mc = mod(MC_WGSL), scan = mod(SCAN_WGSL);
     this.genPipeline = device.createComputePipeline({ layout: "auto", compute: { module: gen, entryPoint: "generate" } });
     this.countPipeline = device.createComputePipeline({ layout: "auto", compute: { module: mc, entryPoint: "count" } });
+    this.brickPipeline = device.createComputePipeline({ layout: "auto", compute: { module: mc, entryPoint: "brickRanges" } });
     this.emitPipeline = device.createComputePipeline({ layout: "auto", compute: { module: mc, entryPoint: "emit" } });
     this.scanPipeline = device.createComputePipeline({ layout: "auto", compute: { module: scan, entryPoint: "scan" } });
     this.addPipeline = device.createComputePipeline({ layout: "auto", compute: { module: scan, entryPoint: "add" } });
@@ -1191,7 +1257,7 @@ export class VolumePlot implements ServeRenderer<Control> {
     };
     this.tables = { cases: upload(t.cases), tris: upload(t.tris), loops: upload(t.loops) };
     this.sampler = device.createSampler({ magFilter: "linear", minFilter: "linear", addressModeU: "clamp-to-edge", addressModeV: "clamp-to-edge", addressModeW: "clamp-to-edge" });
-    this.volumeUniforms = device.createBuffer({ size: 68 * 4, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    this.volumeUniforms = device.createBuffer({ size: 72 * 4, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     this.lineUniforms = device.createBuffer({ size: 80, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     this.allValid = device.createTexture({ size: [1, 1, 1], dimension: "3d", format: "r8unorm", usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
     device.queue.writeTexture({ texture: this.allValid }, Uint8Array.of(255), { bytesPerRow: 1, rowsPerImage: 1 }, [1, 1, 1]);
@@ -1228,30 +1294,10 @@ export class VolumePlot implements ServeRenderer<Control> {
 
   // Data -------------------------------------------------------------------------------------------
 
-  /** Generates a slice into a fresh texture (compute), and reads it back; a file's slice is uploaded. */
-  private async generate(meta: VolumeMeta, slice: number): Promise<{ texture: GPUTexture; validity?: GPUTexture; values: Float32Array }> {
+  /** Generates a slice into a fresh texture (compute), and reads it back. */
+  private async generate(meta: VolumeMeta, slice: number): Promise<{ texture: GPUTexture; values: Float32Array }> {
     const { device } = this;
     const [nz, ny, nx] = meta.shape;
-    if (meta.file) {
-      const t0 = performance.now();
-      const n = nx * ny * nz;
-      const values = meta.file.data.subarray(slice * n, (slice + 1) * n);
-      let gpu = values, valid: Uint8Array | undefined;
-      for (let i = 0; i < n; i += 1) {
-        if (values[i] !== values[i]) { // NaN: 0 in a copy, invalid
-          if (!valid) [gpu, valid] = [values.slice(), new Uint8Array(n).fill(255)];
-          [gpu[i], valid[i]] = [0, 0];
-        }
-      }
-      const tex = (format: GPUTextureFormat, data: Float32Array | Uint8Array, bytes: number) => {
-        const t = device.createTexture({ size: [nx, ny, nz], dimension: "3d", format, usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
-        device.queue.writeTexture({ texture: t }, data, { bytesPerRow: nx * bytes, rowsPerImage: ny }, [nx, ny, nz]);
-        return t;
-      };
-      const texture = tex("r32float", gpu, 4), validity = valid && tex("r8unorm", valid, 1);
-      this.uploadMs = performance.now() - t0;
-      return { texture, validity, values };
-    }
     const texture = device.createTexture({
       size: [nx, ny, nz],
       dimension: "3d",
@@ -1298,16 +1344,38 @@ export class VolumePlot implements ServeRenderer<Control> {
   }
 
   /** The volume of the spec and slice (cached by spec): the data domain over every slice
-   * (`useStableDomain` during playback), and the Fermi level (median, half filling). */
-  private loadData(spec: VolumeSpec, slice: number, scaleType: ScaleType, ignore?: (v: number) => boolean): Promise<Data> {
-    const meta = volumeMeta(spec); // a file's stack read (once per version) now: data and domain of this one
-    const version = meta.file?.version ?? "";
-    const key = JSON.stringify([spec, slice, scaleType, !!ignore, version]);
-    let p = this.dataCache.get(key);
-    if (!p) {
+   * (`useStableDomain` during playback; a file's own slice's with `fixedDomain`, a given colour
+   * domain), and the Fermi level (median, half filling). A file's slice is read by the worker
+   * (`prefetch`: at a lower priority, dropped by a newer one; `preview`: halved, its key the full one's). */
+  private loadData(spec: VolumeSpec, slice: number, scaleType: ScaleType, ignore?: (v: number) => boolean, opts: { fixedDomain?: boolean; prefetch?: boolean; preview?: boolean } = {}): Promise<Data> {
+    const meta = volumeMeta(spec); // a file's header read (once per version) now
+    const file = meta.file;
+    const version = file?.version ?? "";
+    const s = Math.min(Math.max(Math.trunc(slice), 0), meta.slices - 1);
+    const fixed = !!file && !!opts.fixedDomain;
+    const key = JSON.stringify([spec, s, scaleType, !!ignore, version, fixed]);
+    const preview = !!file && !!opts.preview;
+    const entry = preview ? `${key}|preview` : key;
+    if (file && this.fileVersions.get(file.path) !== version) { // the file changed: what was read of it goes
+      const old = this.fileVersions.get(file.path);
+      if (old !== undefined) for (const k of [...this.dataCache.keys()]) if (k.includes(JSON.stringify(old))) this.dropData(k);
+      this.fileVersions.set(file.path, version);
+    }
+    let p = this.dataCache.get(entry);
+    const hit = !!p;
+    if (p) {
+      if (file && !opts.prefetch) this.reader.promote(file, s, preview);
+      this.dataCache.delete(entry); // most recently used last
+    } else if (file) {
       p = (async () => {
-        const s = Math.min(Math.max(Math.trunc(slice), 0), meta.slices - 1);
-        const { texture, validity, values } = await this.generate(meta, s);
+        const d = await this.reader.slice(file, s, { prefetch: opts.prefetch, preview });
+        const domain = statsDomain(fixed ? d.stats : await this.stackStats(file), scaleType);
+        const dims = preview ? meta.shape.map((n) => n >> 1) as [number, number, number] : undefined;
+        return { key, meta, slice: s, values: d.values, valid: d.valid, readMs: d.ms, dataDomain: domain ?? [...DEFAULT_DOMAIN], dims } as Data;
+      })();
+    } else {
+      p = (async () => {
+        const { texture, values } = await this.generate(meta, s);
         const domain = await this.stableDomain(spec, meta, scaleType, ignore, s, values, version);
         let fermi: number | undefined;
         if (meta.kind === 4) {
@@ -1315,34 +1383,96 @@ export class VolumePlot implements ServeRenderer<Control> {
           const n = sorted.length;
           fermi = n % 2 ? sorted[(n - 1) / 2] : (sorted[n / 2 - 1] + sorted[n / 2]) / 2; // np.median
         }
-        return { key, meta, slice: s, texture, validity, values, dataDomain: domain ?? [...DEFAULT_DOMAIN], fermi } as Data;
+        return { key, meta, slice: s, texture, values, dataDomain: domain ?? [...DEFAULT_DOMAIN], fermi } as Data;
       })();
-      p.catch(() => this.dataCache.delete(key));
-      if (this.dataCache.size >= 24) {
-        const [oldest] = this.dataCache.keys();
-        this.dataCache.get(oldest)?.then((d) => { if (d !== this.data) { d.texture.destroy(); d.validity?.destroy(); } });
-        this.dataCache.delete(oldest);
-      }
-      this.dataCache.set(key, p);
+    }
+    this.dataCache.set(entry, p!);
+    if (!hit) {
+      p!.then((d) => { // its bytes, once read
+        if (this.dataCache.get(entry) !== p) return;
+        this.dataHeld.set(entry, d);
+        this.trimData();
+      }, () => this.dropData(entry));
+    }
+    this.trimData();
+    return p!;
+  }
+
+  /** Least recently used slices out, beyond 24 or FILE_CACHE_BYTES held (CPU): never the
+   * newest, nor the one shown, whatever their size. */
+  private trimData(): void {
+    const size = (d?: Data) => (d ? d.values.byteLength + (d.valid?.byteLength ?? 0) : 0);
+    let bytes = 0;
+    for (const d of this.dataHeld.values()) bytes += size(d);
+    const keys = [...this.dataCache.keys()].slice(0, -1).filter((k) => this.dataHeld.get(k) !== this.data);
+    for (const k of keys) {
+      if (this.dataCache.size <= 24 && bytes <= FILE_CACHE_BYTES) break;
+      bytes -= size(this.dataHeld.get(k));
+      this.dropData(k);
+    }
+  }
+
+  private dropData(key: string): void {
+    this.dataCache.get(key)?.then((d) => { if (d !== this.data) d.texture?.destroy(); }, () => {});
+    this.dataCache.delete(key);
+    this.dataHeld.delete(key);
+  }
+
+  /** Value ranges of a file's whole stack (once per version), read by the worker. */
+  private stackStats(file: StackFile): Promise<Float64Array> {
+    const key = stackKey(file); // as the stack is read: version, dtype, offset, shape
+    let p = this.statsCache.get(key);
+    if (!p) {
+      for (const k of this.statsCache.keys()) if (k.startsWith(`${file.path}|`) && !k.startsWith(`${file.path}|${file.version}|`)) this.statsCache.delete(k); // older versions
+      p = this.reader.stats(file);
+      p.catch(() => this.statsCache.delete(key));
+      this.statsCache.set(key, p);
     }
     return p;
   }
 
-  /** Data domain over every slice (cached by spec and scale, once per stack: playback requests
-   * each slice in turn); slice `s`'s `values` are at hand, the others are generated for it. */
+  /** The textures of a slice: its own, or a file's uploaded into a pooled pair (reused across
+   * slices of a shape; the queue orders the upload after frames already submitted). */
+  private bind(data: Data): { texture: GPUTexture; validity: GPUTexture } {
+    if (data.texture) return { texture: data.texture, validity: this.allValid };
+    const { device } = this;
+    const [nz, ny, nx] = data.dims ?? data.meta.shape;
+    const slotKey = `${data.key}|${data.dims ?? ""}`;
+    const at = this.slots.findIndex((sl) => sl.key === slotKey);
+    let slot = at >= 0 ? this.slots.splice(at, 1)[0] : this.slots.length >= GPU_SLICES ? this.slots.shift() : undefined;
+    if (at < 0) {
+      const t0 = performance.now();
+      const fits = (t: GPUTexture) => t.width === nx && t.height === ny && t.depthOrArrayLayers === nz;
+      if (slot && !fits(slot.texture)) {
+        slot.texture.destroy();
+        slot.validity?.destroy();
+        slot = undefined;
+      }
+      const tex = (format: GPUTextureFormat) => device.createTexture({ size: [nx, ny, nz], dimension: "3d", format, usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
+      slot ??= { key: "", texture: tex("r32float") };
+      if (data.valid) slot.validity ??= tex("r8unorm");
+      device.queue.writeTexture({ texture: slot.texture }, data.values, { bytesPerRow: nx * 4, rowsPerImage: ny }, [nx, ny, nz]);
+      if (data.valid) device.queue.writeTexture({ texture: slot.validity! }, data.valid, { bytesPerRow: nx, rowsPerImage: ny }, [nx, ny, nz]);
+      slot.key = slotKey;
+      this.uploadMs = performance.now() - t0;
+    }
+    this.slots.push(slot!);
+    return { texture: slot!.texture, validity: data.valid ? slot!.validity! : this.allValid };
+  }
+
+  /** Data domain over every slice of a generator (cached by spec and scale, once per stack: playback
+   * requests each slice in turn); slice `s`'s `values` are at hand, the others are generated for it. */
   private stableDomain(spec: VolumeSpec, meta: VolumeMeta, scaleType: ScaleType, ignore: ((v: number) => boolean) | undefined, s: number, values: Float32Array, version: string): Promise<[number, number] | null> {
     const key = JSON.stringify([spec, scaleType, !!ignore, version]);
     let p = this.domainCache.get(key);
     if (!p) {
       p = (async () => {
-        if (meta.file) return getDomain(meta.file.data, scaleType, ignore) ?? null; // the whole stack, on the CPU (NaN skipped)
         let lo = Infinity, hi = -Infinity;
         for (let k = 0; k < meta.slices; k += 1) {
           let vals = values;
           if (k !== s) { // other slices: domain only
             const other = await this.generate(meta, k);
             other.texture.destroy();
-            other.validity?.destroy();
             vals = other.values;
           }
           const d = getDomain(vals, scaleType, ignore);
@@ -1362,24 +1492,38 @@ export class VolumePlot implements ServeRenderer<Control> {
 
   // Isosurfaces ------------------------------------------------------------------------------------
 
-  /** Marching cubes on the GPU: count per cell, exclusive prefix sum, emit. */
+  /** Marching cubes on the GPU: count per cell, exclusive prefix sum, emit; over the cells of
+   * the bricks whose valid values straddle the level (each cell in one brick), or every cell
+   * (`fullMarch`, for checks). */
   private async extract(data: Data, level: number, vis: VisScale, centres: Float32Array): Promise<IsoMesh> {
     const t0 = performance.now();
     const { device } = this;
     const [nz, ny, nx] = data.meta.shape;
-    const cells = (nx - 1) * (ny - 1) * (nz - 1);
-    const kind = Array.isArray(vis) ? (vis[0] === "symlog" ? 2 : 0) : vis === "log" ? 1 : vis === "sqrt" ? 3 : vis === "symlog" ? 2 : 0;
-    const key = `${data.key}|${level}|${JSON.stringify(vis)}`;
+    const [kind, constant] = mcScale(vis);
+    const key = meshKey(data, level, vis, this.fullMarch);
     if (kind === 1 && !(level > 0) || kind === 3 && !(level >= 0) || !Number.isFinite(level)) {
       return { level, key, triangles: 0, ms: 0 };
     }
+    let active: Uint32Array | undefined;
+    if (!this.fullMarch) {
+      const bricks = data.bricks ??= await this.brickRanges(data);
+      const lv = Math.fround(level); // as the shader compares: some corner below, some at or above
+      const list: number[] = [];
+      for (let b = 0; b < bricks.length / 2; b += 1) if (bricks[2 * b] < lv && bricks[2 * b + 1] >= lv) list.push(b); // none valid: max < min
+      if (!list.length) return { level, key, triangles: 0, ms: performance.now() - t0 };
+      active = Uint32Array.from(list);
+    }
+    const cells = active ? active.length * BRICK ** 3 : (nx - 1) * (ny - 1) * (nz - 1);
+    const { texture, validity } = this.bind(data);
     const usage = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC;
-    const u = new ArrayBuffer(32);
+    const u = new ArrayBuffer(48);
     new Uint32Array(u).set([nx, ny, nz, kind]);
-    new Float32Array(u).set([level, Array.isArray(vis) ? vis[1] : 1], 4);
-    new Uint32Array(u)[6] = cells;
-    const ub = device.createBuffer({ size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    new Float32Array(u).set([level, constant], 4);
+    new Uint32Array(u).set([cells, active ? 1 : 0, ...(active ? brickDims(data.meta.shape) : [0, 0, 0]), 0], 6);
+    const ub = device.createBuffer({ size: 48, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     device.queue.writeBuffer(ub, 0, u);
+    const activeBuf = device.createBuffer({ size: Math.max(active?.byteLength ?? 0, 16), usage });
+    if (active) device.queue.writeBuffer(activeBuf, 0, active);
     const counts = device.createBuffer({ size: cells * 4, usage });
     const centreBuf = device.createBuffer({ size: centres.byteLength, usage });
     device.queue.writeBuffer(centreBuf, 0, centres);
@@ -1388,17 +1532,18 @@ export class VolumePlot implements ServeRenderer<Control> {
       layout: pipeline.getBindGroupLayout(0),
       entries: [
         { binding: 0, resource: { buffer: ub } },
-        { binding: 1, resource: data.texture.createView() },
+        { binding: 1, resource: texture.createView() },
         { binding: 2, resource: { buffer: this.tables.cases } },
         { binding: 3, resource: { buffer: this.tables.tris } },
         { binding: 4, resource: { buffer: this.tables.loops } },
         { binding: 5, resource: { buffer: centreBuf } },
         { binding: 6, resource: { buffer: counts } },
         { binding: 7, resource: { buffer: verts } },
-        { binding: 8, resource: (data.validity ?? this.allValid).createView() },
+        { binding: 8, resource: validity.createView() },
+        { binding: 9, resource: { buffer: activeBuf } },
       ],
     });
-    const temps: GPUBuffer[] = [ub, centreBuf, dummy];
+    const temps: GPUBuffer[] = [ub, centreBuf, dummy, activeBuf];
     let encoder = device.createCommandEncoder();
     let pass = encoder.beginComputePass();
     pass.setPipeline(this.countPipeline);
@@ -1456,10 +1601,43 @@ export class VolumePlot implements ServeRenderer<Control> {
       pass.end();
       device.queue.submit([encoder.finish()]);
     }
-    await device.queue.onSubmittedWorkDone();
-    counts.destroy();
+    counts.destroy(); // once the work submitted with them is done
     for (const b of temps) b.destroy();
     return { level, key, buffer: vertexBuffer, triangles, ms: performance.now() - t0 };
+  }
+
+  /** Value ranges of the bricks of a slice (`ranges` of MC_WGSL), read back: min, max each. */
+  private async brickRanges(data: Data): Promise<Float32Array> {
+    const { device } = this;
+    const [nz, ny, nx] = data.meta.shape;
+    const nb = brickDims(data.meta.shape);
+    const count = nb[0] * nb[1] * nb[2];
+    const { texture, validity } = this.bind(data);
+    const ub = device.createBuffer({ size: 48, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    device.queue.writeBuffer(ub, 0, Uint32Array.of(nx, ny, nz, 0, 0, 0, 0, 0, ...nb, 0));
+    const out = device.createBuffer({ size: count * 8, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+    const read = makeReadBuffer(device, count * 8);
+    const encoder = device.createCommandEncoder();
+    const pass = encoder.beginComputePass();
+    pass.setPipeline(this.brickPipeline);
+    pass.setBindGroup(0, device.createBindGroup({
+      layout: this.brickPipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: ub } },
+        { binding: 1, resource: texture.createView() },
+        { binding: 8, resource: validity.createView() },
+        { binding: 10, resource: { buffer: out } },
+      ],
+    }));
+    pass.dispatchWorkgroups(...dispatch2D(Math.ceil(count / 64)));
+    pass.end();
+    encoder.copyBufferToBuffer(out, 0, read, 0, count * 8);
+    device.queue.submit([encoder.finish()]);
+    await read.mapAsync(GPUMapMode.READ);
+    const ranges = new Float32Array(read.getMappedRange().slice(0));
+    read.unmap();
+    for (const b of [ub, out, read]) b.destroy();
+    return ranges;
   }
 
   /** Vertices (index space, x y z) of an extracted level, for checks against `marchingCubes` (lib/marching_cubes.ts). */
@@ -1483,11 +1661,12 @@ export class VolumePlot implements ServeRenderer<Control> {
 
   /** The voxels of the current slice as read back from the GPU, and its spec's metadata. */
   get volumeData(): { values: Float32Array; meta: VolumeMeta; fermi?: number } | undefined {
-    return this.data && { values: this.data.values, meta: this.data.meta, fermi: this.data.fermi };
+    const valid = this.data?.valid;
+    return this.data && { values: valid ? this.data.values.map((v, i) => (valid[i] ? v : NaN)) : this.data.values, meta: this.data.meta, fermi: this.data.fermi };
   }
 
   get isoStats(): { level: number; triangles: number; ms: number }[] {
-    return this.meshes.map(({ level, triangles, ms }) => ({ level, triangles, ms: Math.round(ms * 10) / 10 }));
+    return this.meshes.map(({ level, triangles, ms, deferred }) => ({ level, triangles, ms: Math.round(ms * 10) / 10, ...(deferred ? { deferred } : {}) }));
   }
 
   // Colour ---------------------------------------------------------------------------------------
@@ -1586,7 +1765,15 @@ export class VolumePlot implements ServeRenderer<Control> {
     const preScale: ScaleType = ctl.scale === "log" ? "log" : ctl.scale === "symlog" ? "symlog" : ctl.scale === "sqrt" || ctl.scale === "root" ? "gamma" : "linear";
     const ignore = ctl.valueTransform ? (v: number) => !Number.isFinite(v) : undefined; // logarithms: ±∞ ignored
     const slice = this.sliceSlider(ctl);
-    const data = await this.loadData(ctl.volume, slice, preScale, ignore);
+    const fixedDomain = Array.isArray(ctl.domain) && ctl.domain.length === 2 && ctl.domain.every((v) => v !== null && Number.isFinite(v));
+    // while interacting, a large file's slices halved; the next one in a drag's direction read meanwhile
+    const { file, shape } = volumeMeta(ctl.volume);
+    const preview = !!file && !!ctl.interacting && shape[0] * shape[1] * shape[2] >= PREVIEW_VOXELS && shape.every((n) => n % 2 === 0);
+    const data = await this.loadData(ctl.volume, slice, preScale, ignore, { fixedDomain, preview });
+    const step = Math.sign(data.slice - (this.data?.slice ?? data.slice));
+    if (file && ctl.interacting && step && data.slice + step >= 0 && data.slice + step < data.meta.slices) {
+      this.loadData(ctl.volume, data.slice + step, preScale, ignore, { fixedDomain, prefetch: true, preview }).catch(() => {});
+    }
     this.data = data;
     const meta = data.meta;
     const [nz, ny, nx] = meta.shape;
@@ -1614,20 +1801,31 @@ export class VolumePlot implements ServeRenderer<Control> {
       off += t?.length ?? 0;
     }
 
-    // Isosurfaces: (re)extracted when the data, a level or the scale changes
+    // Isosurfaces: extracted when the data, a level or the geometry's scale changes (cached), not
+    // while interacting (a slider drag): a mesh not at hand is then left out, its depth too
     const levels = (ctl.isoLevels ?? (data.fermi !== undefined ? [Math.round(data.fermi * 1000) / 1000] : [])).map(Number);
-    const wanted = levels.map((level) => `${data.key}|${level}|${JSON.stringify(colors.vis)}`);
-    if (wanted.join("\n") !== this.meshes.map((m) => m.key).join("\n")) {
-      const centres = Float32Array.from(lookupsByAxis.flatMap((t, a) =>
-        Array.from({ length: counts[a] }, (_, i) => (t ? t[2 * i + 1] : (i + 0.5) / counts[a]))));
-      const keep = new Map(this.meshes.map((m) => [m.key, m]));
-      const next: IsoMesh[] = [];
-      for (let i = 0; i < levels.length; i += 1) {
-        next.push(keep.get(wanted[i]) ?? await this.extract(data, levels[i], colors.vis, centres));
-        keep.delete(wanted[i]);
+    let centres: Float32Array | undefined;
+    const next: IsoMesh[] = [];
+    for (const level of levels) {
+      const key = meshKey(data, level, colors.vis, this.fullMarch);
+      let m = this.meshCache.get(key);
+      if (!m && !ctl.interacting) {
+        centres ??= Float32Array.from(lookupsByAxis.flatMap((t, a) =>
+          Array.from({ length: counts[a] }, (_, i) => (t ? t[2 * i + 1] : (i + 0.5) / counts[a]))));
+        m = await this.extract(data, level, colors.vis, centres);
       }
-      for (const m of keep.values()) m.buffer?.destroy();
-      this.meshes = next;
+      if (m) { // most recently used last
+        this.meshCache.delete(key);
+        this.meshCache.set(key, m);
+      }
+      next.push(m ?? { level, key, triangles: 0, ms: 0, deferred: true });
+    }
+    this.meshes = next;
+    for (const [key, m] of this.meshCache) {
+      if (this.meshCache.size <= MESH_CACHE) break;
+      if (next.includes(m)) continue;
+      m.buffer?.destroy(); // frames in flight keep it until they complete
+      this.meshCache.delete(key);
     }
 
     // Camera: fitted to the box corners, as curve.ts
@@ -1678,7 +1876,8 @@ export class VolumePlot implements ServeRenderer<Control> {
 
     // Uniforms
     const samples = SAMPLES_PER_VOXEL[ctl.quality as Quality] ?? 1;
-    const steps = [getStepCount(lookupsByAxis[0], nx), getStepCount(lookupsByAxis[1], ny), getStepCount(lookupsByAxis[2], nz)];
+    const [tz, ty, tx] = data.dims ?? meta.shape; // the texture's (a preview's halved; file axes are uniform)
+    const steps = [getStepCount(lookupsByAxis[0], tx), getStepCount(lookupsByAxis[1], ty), getStepCount(lookupsByAxis[2], tz)];
     const opaqueIso = this.meshes.some((m) => m.triangles > 0);
     const modeIndex = ctl.mode === "MIP" ? 0 : ctl.mode === "Iso" ? 2 : 1;
     const scaleIndex = colors.shaderScale === "log" ? 1 : colors.shaderScale === "symlog" ? 2 : colors.shaderScale === "sqrt" ? 3 : 0;
@@ -1687,11 +1886,11 @@ export class VolumePlot implements ServeRenderer<Control> {
     // the ray march is most of the frame's cost
     const half = ctl.interacting && ctl.showVolume !== false;
     const [vw, vh] = half ? halfSize(w, h) : [w, h];
-    const vu = new Float32Array(68);
+    const vu = new Float32Array(72);
     vu.set(clip, 0);
     vu.set(invClip, 16);
     vu.set([camBox.x, camBox.y, camBox.z, 1], 32);
-    vu.set([nx, ny, nz, ctl.interacting ? samples / 2 : samples], 36);
+    vu.set([tx, ty, tz, ctl.interacting ? samples / 2 : samples], 36);
     vu.set([...steps, Number(ctl.opacity)], 40);
     vu.set([colors.domainMin, colors.oneOverRange, colors.gammaExponent, colors.symlogConstant], 44);
     vu.set([1, 0, Number(ctl.threshold), colors.thresholdU.oneOverRamp], 48);
@@ -1699,6 +1898,7 @@ export class VolumePlot implements ServeRenderer<Control> {
     vu.set([scaleIndex, ...lookupOffsets], 56);
     vu.set([vw, vh, colors.diverging?.scale ?? 0, colors.diverging?.centre ?? 0], 60);
     vu.set([w / vw, h / vh, half ? 1 : 0, 0], 64);
+    vu.set([...boxSize, OPACITY_VOXELS], 68);
     device.queue.writeBuffer(this.volumeUniforms, 0, vu);
     const tg = this.ensureTargets(w, h);
 
@@ -1808,18 +2008,19 @@ export class VolumePlot implements ServeRenderer<Control> {
         : { view: tg.layer.createView(), loadOp: "load", storeOp: "store" }],
     });
     if (ctl.showVolume !== false) {
+      const bound = this.bind(data);
       const volumePipeline = this.volumePipeline(lookupsByAxis.map((t) => !!t), modeIndex, scaleIndex);
       vp.setPipeline(volumePipeline);
       vp.setBindGroup(0, device.createBindGroup({
         layout: volumePipeline.getBindGroupLayout(0),
         entries: [
           { binding: 0, resource: { buffer: this.volumeUniforms } },
-          { binding: 1, resource: data.texture.createView() },
+          { binding: 1, resource: bound.texture.createView() },
           { binding: 2, resource: this.sampler },
           { binding: 3, resource: { buffer: this.colorMapBuffer(colors.colormap, !!ctl.invertColormap) } },
           { binding: 4, resource: { buffer: this.lookupBuffer! } },
           { binding: 5, resource: tg.isoDepth.createView() },
-          { binding: 6, resource: (data.validity ?? this.allValid).createView() },
+          { binding: 6, resource: bound.validity.createView() },
         ],
       }));
       vp.draw(36);
@@ -1855,7 +2056,7 @@ export class VolumePlot implements ServeRenderer<Control> {
     this.colorBar(q, ctl, colors, R + Math.round(36 * s), T + Math.round(34 * s), barBottom, s);
     this.slider = root === null ? null : rootSlider(q, F.label, R + Math.round(36 * s), sliderTop, Math.round(100 * s), root, s, ctl.sliderHot === ROOT_HOT);
     this.hoverInfo = null;
-    if (ctl.hover) {
+    if (ctl.hover && !data.dims) { // not over a preview
       const info = this.pick(ctl, Number(ctl.hover[0]), Number(ctl.hover[1]), values, counts);
       if (info) {
         this.drawHover(q, ctl, info);
@@ -2033,8 +2234,11 @@ export class VolumePlot implements ServeRenderer<Control> {
       const f = Math.min(Math.max((p - t[lo]) / Math.max(t[lo + 1] - t[lo], 1e-30), 0), 1);
       return (lo + f) / (t.length - 1);
     };
-    const v = data.values;
-    const at = (i: number, j: number, k: number) => v[(Math.min(Math.max(k, 0), nz - 1) * ny + Math.min(Math.max(j, 0), ny - 1)) * nx + Math.min(Math.max(i, 0), nx - 1)];
+    const { values: v, valid: ok } = data;
+    const at = (i: number, j: number, k: number) => {
+      const idx = (Math.min(Math.max(k, 0), nz - 1) * ny + Math.min(Math.max(j, 0), ny - 1)) * nx + Math.min(Math.max(i, 0), nx - 1);
+      return ok && !ok[idx] ? NaN : v[idx];
+    };
     const sample = (p: Vec3): { value: number; tex: Vec3 } => {
       const tex = [toTex(p[0], 0), toTex(p[1], 1), toTex(p[2], 2)] as Vec3;
       const g = tex.map((t, a) => t * counts[a] - 0.5);
@@ -2151,7 +2355,7 @@ export class VolumePlot implements ServeRenderer<Control> {
       ...(this.slider ? { rootN: this.slider.value, rootSlider: this.slider } : {}),
       ...(this.sliders.length ? { sliders: this.sliders } : {}),
       ...(meta.sliceAxis ? { sliceValue: axisValues(meta.sliceAxis)[this.data!.slice] } : {}),
-      ...(meta.file ? { file: { path: meta.file.path, readMs: Math.round(meta.file.readMs), sliceUploadMs: Math.round(this.uploadMs * 100) / 100 } } : {}),
+      ...(meta.file ? { file: { path: meta.file.path, sliceReadMs: Math.round((this.data!.readMs ?? 0) * 100) / 100, sliceUploadMs: Math.round(this.uploadMs * 100) / 100 } } : {}),
       isosurfaces: this.isoStats,
       fermiLevel: this.data!.fermi ?? null,
     };

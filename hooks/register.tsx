@@ -661,7 +661,7 @@ async function onPointer($: any, kind: Kind, ev: any) {
     const hit = await sliderAt()
     if (hit) {
       view.drag = { x, y, ctl: { ...ctl }, win: null, zooming: false, slider: hit.sl } as any
-      if (hit.sl.kind !== 'root') ctl.interacting = true // curve.ts holds its framing while a parameter moves
+      ctl.interacting = true // curve.ts holds its framing while a slider moves; volume.ts renders cheaper frames, isosurfaces on release
       setFromSlider(hit.sl, hit.px)
       await writeControl($, kind)
       return
@@ -1340,7 +1340,7 @@ export const register: Register = (on, options) => {
           symmetric: { type: 'boolean', description: 'domain symmetric about `center` (0): diverging data' },
           center: { type: 'number' },
           mode: { type: 'string', enum: ['DVR', 'MIP', 'Iso'], description: 'DVR (default): emission-absorption; MIP: maximum; Iso: first crossing of threshold' },
-          opacity: { type: 'number', description: 'DVR opacity scale (0.25)' },
+          opacity: { type: 'number', description: 'DVR opacity scale (0.25), per 1/56 of the box: alike at any resolution' },
           threshold: { type: 'number', description: 'normalised value (0..1) below which voxels are clear (0.1)' },
           quality: { type: 'string', enum: ['low', 'medium', 'high'] },
           isoLevels: { type: ['array', 'null'], items: { type: 'number' }, description: 'opaque isosurfaces (marching cubes) at these data values' },
