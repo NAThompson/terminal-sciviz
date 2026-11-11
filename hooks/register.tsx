@@ -1459,7 +1459,7 @@ export const register: Register = (on, options) => {
   // A view's call row (`sciviz - chart (MCP)(title: ..., series: [...])`) is code in the middle of
   // the explanation: the figure stands alone between the text. ctrl+o (expanded) and errors show it.
   on('ui.render', { component: 'ToolUse' }, async ($, e, next) => {
-    const views = [VIEW_TOOL, PLOT_TOOL, OPEN_TOOL, CHART_TOOL, SCENE_TOOL, VOLUME_TOOL]
+    const views = [TOOL, VIEW_TOOL, PLOT_TOOL, OPEN_TOOL, CHART_TOOL, SCENE_TOOL, VOLUME_TOOL]
     if (!views.includes(e.props.tool) || e.props.isExpanded || e.props.isErrored || e.surface !== 'terminal') return next(e)
     const { Box } = $.ui.resolve(e)
     return <Box />
