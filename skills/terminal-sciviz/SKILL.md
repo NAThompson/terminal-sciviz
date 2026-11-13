@@ -16,7 +16,7 @@ has a visible effect, render the alternatives side by side and show them before 
 |---|---|
 | A PNG you made (matplotlib, a renderer, a screenshot) | `mcp__sciviz__show` with the absolute `path` (and a one-line `caption`) |
 | A live chart of **your own** data or functions (scatter/bubble, lines, bars, areas, histograms, heatmaps, distributions, fits) | `mcp__sciviz__chart` with `marks`: each a type (`line`, `dot`, `bar`, `barX`, `area`, `rect`, `rule`, `text`, `interval`, `box`) over `data` columns (or a CSV/JSON `file` with a header, or a function `fn`), channels naming columns (`x`, `y`, `fill`, `r`, `z`, ...) and `transform`s (below). A later call without `marks`/`series` adjusts the same chart (window, title, scales). `series` is the older one-line-per-entry shorthand |
-| A live 3D scene of **your own** data: 3D scatter, point clouds, 3D polylines, triangle meshes, convex hulls | `mcp__sciviz__scene` with `marks` (`dot`, `line`, `mesh`) over `data` columns or a `file`, channels `x`, `y`, `z`, `fill`, `r` like `chart` (below) |
+| A live 3D scene of **your own** data: 3D scatter, point clouds, 3D polylines, triangle meshes, convex hulls, exact NURBS / Bézier patches under points | `mcp__sciviz__scene` with `marks` (`dot`, `line`, `mesh`, `surface`) over `data` columns or a `file`, channels `x`, `y`, `z`, `fill`, `r` like `chart` (below) |
 | A live 3D volume of **your own** array (a 3D field, or a 4D stack over time / a parameter) | `mcp__sciviz__volume` with `volume: {dataset: "file", path}`: a `.npy` (or raw little-endian `.f32` with `shape`), `axes` [x, y, z, slice?] `{lo, hi, label, unit}`; NaN = transparent; a 4D array gets a slice slider. Colour/opacity/iso fields like the volume gallery entries |
 | An interactive view of a gallery entry (lines, curves, complex, volumes, scenes...) | `mcp__sciviz__gallery_open` with its `id` (fuzzy names work: `blocks`, `lorenz`); `control` overrides fields (window `x0`/`x1`, camera `azimuth`/`elevation`/`zoom`, `colormap`) |
 | A live 3D surface: built-in (`torus`, `sphere`, `wave`, `dini`, `breather`, `teapot`) or **your own** | `mcp__sciviz__view` with `surface`, or with `nurbs` (one patch or an array of patches; see below) |
@@ -96,7 +96,10 @@ are shaded spheres, fast to 10⁵ points (give a `file` past 64 kB). `line` draw
 order, one per `group` (default: a categorical fill). `mesh` takes `vertices` + `faces` (or x/y/z
 columns + `faces`), `shading: "smooth"`, `edges: true`, `opacity` (translucent meshes let what's
 behind them show, dimmed). `transform: {hull: true}` on a dot mark draws its convex hull; add the
-points again as a second dot mark to see them inside. Equal aspect by default; `aspect: "auto"`
+points again as a second dot mark to see them inside. `{type: "surface", nurbs, fill: "field"}`
+draws exact patches (`view`'s `nurbs` shape, one or an array; `resolution` steps, 32) as a smooth
+mesh, coloured by the patch's `fields` on the same colour scale as numeric-fill dots (or a
+`#rrggbb`, with `opacity`): a fitted or true surface under the points on it. Equal aspect by default; `aspect: "auto"`
 when the axes have unrelated units. Hover reports the point's row. Use `chart` for anything 2D.
 
 **Distributions and fits: pass raw data with a transform**, not bins or quantiles you computed:

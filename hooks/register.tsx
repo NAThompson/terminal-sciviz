@@ -1024,7 +1024,7 @@ export const register: Register = (on, options) => {
   on('tool.call', { tool: SCENE_TOOL }, async ($, e) => {
     const input = e as any
     const size = JSON.stringify(input.marks ?? null).length // as chart: past 64 kB, data goes in files
-    if (size > 64_000) return { deny: `marks are ${size} bytes inline; keep them under 64 kB: write the data to a .json/.csv/.tsv file and give each mark \`file\` (absolute path) instead of inline data` }
+    if (size > 64_000) return { deny: `marks are ${size} bytes inline; keep them under 64 kB: write the data to a .json/.csv/.tsv file and give each mark \`file\` (absolute path) instead of inline data (nurbs: exact low-degree patches, or a coarse control net)` }
     for (const m of Array.isArray(input.marks) ? input.marks : []) {
       const f = m?.file
       if (f === undefined) continue
@@ -1253,10 +1253,11 @@ export const register: Register = (on, options) => {
       description:
         'Show the user a live 3D scene of your own data inline in the chat, right here between your text (WebGPU; they drag to orbit, ' +
         'shift-drag/+/- to zoom, hover a point for its row, r resets). Built from `marks` like `chart`: dot (3D scatter, point clouds: ' +
-        'shaded spheres, 10⁵ points stay fast), line (3D polylines), mesh (triangles), each over `data` columns or a `file`. ' +
+        'shaded spheres, 10⁵ points stay fast), line (3D polylines), mesh (triangles), each over `data` columns or a `file`, surface (NURBS / Bézier patches, exact). ' +
         'Examples: scatter {type:"dot", data, x:"a", y:"b", z:"c", fill:"species"}; point cloud coloured by a value {type:"dot", file, fill:"t", r:1.5}; ' +
         'convex hull over points {type:"dot", data, transform:{hull:true}} plus the points themselves as a second dot mark; ' +
-        'surface mesh {type:"mesh", vertices:[[x,y,z],...], faces:[[i,j,k],...], shading:"smooth"}. ' +
+        'surface mesh {type:"mesh", vertices:[[x,y,z],...], faces:[[i,j,k],...], shading:"smooth"}; ' +
+        'exact patch under points on one colour scale {type:"surface", nurbs:{degrees:[2,2], shape:[3,3], points, weights, knots, fields:[f]}, fill:"field"} plus {type:"dot", data, fill:"f"}. ' +
         'Axes: a box with ticks on the edges facing the camera, equal aspect unless `aspect`. A call with `marks` opens a new scene; ' +
         'without, it changes only the fields given (camera, title, aspect...). Waits for the frame and returns the control, renderer state ' +
         '(camera, box, hover row) and a PNG snapshot path you can Read to see what the user sees.',
@@ -1271,12 +1272,12 @@ export const register: Register = (on, options) => {
             items: {
               type: 'object',
               properties: {
-                type: { type: 'string', enum: ['dot', 'line', 'mesh'], description: 'dot: x, y, z (fill, r); line: x, y, z in row order, one polyline per `group`; mesh: vertices + faces, or x, y, z columns + faces (row indices)' },
+                type: { type: 'string', enum: ['dot', 'line', 'mesh', 'surface'], description: 'dot: x, y, z (fill, r); line: x, y, z in row order, one polyline per `group`; mesh: vertices + faces, or x, y, z columns + faces (row indices); surface: `nurbs`, drawn as a smooth mesh (fill, opacity, edges, shading; no data, no slice)' },
                 data: { description: 'columns {name: [...], ...} (one length) or rows [{name: value, ...}, ...]; null: a gap' },
                 file: { type: 'string', description: 'instead of data: absolute path to a .csv/.tsv with a header row or .json (columns or rows); for more than 64 kB' },
                 x: { type: ['string', 'number'], description: 'a column name or a constant (default: the column "x")' },
                 y: { type: ['string', 'number'] }, z: { type: ['string', 'number'] },
-                fill: { type: 'string', description: 'colour: a column (strings: categories, Okabe–Ito, a legend entry each, at most 7; numbers: the colormap and a colour bar) or #rrggbb; stroke is the same channel' },
+                fill: { type: 'string', description: 'colour: a column (strings: categories, Okabe–Ito, a legend entry each, at most 7; numbers: the colormap and a colour bar) or #rrggbb; surface: "field" (the patch\'s first field, on the colour scale of the numeric fills) or #rrggbb; stroke is the same channel' },
                 stroke: { type: 'string' },
                 r: { type: ['string', 'number'], description: 'dot radius: CSS px (3) or a column (sqrt scale, top-level `r`)' },
                 group: { type: 'string', description: 'line: a column splitting rows into polylines (default: a categorical fill)' },
@@ -1284,7 +1285,15 @@ export const register: Register = (on, options) => {
                 width: { type: 'number', description: 'line and edge width, CSS px (line 2, edges 1)' },
                 vertices: { type: 'array', items: { type: 'array', items: { type: 'number' } }, description: 'mesh: [[x, y, z], ...]' },
                 faces: { type: 'array', items: { type: 'array', items: { type: 'integer' } }, description: 'mesh: [[i, j, k], ...] vertex/row indices, counter-clockwise seen from outside' },
-                shading: { type: 'string', enum: ['flat', 'smooth'], description: 'mesh (default flat; smooth: averaged vertex normals)' },
+                nurbs: {
+                  type: ['object', 'array'],
+                  items: { type: 'object' },
+                  description: 'surface: a patch as `view`\'s nurbs, {degrees: [p, q], shape: [nu, nv], points: flat xyz (nu*nv*3, u outer), weights: nu*nv, ' +
+                    'knots: [u knots (nu+p+1), v knots (nv+q+1)], fields?: [nu*nv control values]}, or an array of them (1 to 256); ' +
+                    'an edge collapsed to a point makes a triangle',
+                },
+                resolution: { type: 'integer', description: 'surface: steps along u and along v, shared among the knot spans (32)' },
+                shading: { type: 'string', enum: ['flat', 'smooth'], description: 'mesh (default flat; smooth: averaged vertex normals); surface (default smooth: its exact normals)' },
                 edges: { type: ['boolean', 'string'], description: 'mesh: draw its edges (true, or a #rrggbb colour)' },
                 transform: { type: 'object', description: '{hull: true}: the 3D convex hull of the points as a mesh (≥ 4 non-coplanar points)' },
                 label: { type: 'string', description: 'legend entry of a mark without categorical fill' },

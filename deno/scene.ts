@@ -10,6 +10,9 @@
  *   smooth shading, `opacity` (translucent meshes drawn after everything opaque, back faces then
  *   front faces, so what is behind them shows through dimmed), optional `edges`.
  * - transform `hull: true` (dot or mesh): the 3D convex hull of the points (lib/hull.ts), as a mesh.
+ * - surface: `nurbs`, a NURBS / Bézier patch or an array of them (lib/nurbs.ts, as surface.ts takes
+ *   them), evaluated in f64 on a grid per knot span (`resolution` steps along u and v, 32) and drawn
+ *   as a smooth mesh with the evaluator's normals; `fill: "field"` colours it by its first field.
  *
  * fill: a column (strings: the Okabe–Ito palette, a legend entry each; numbers: a colour map with a
  * colour bar) or a #rrggbb colour; r: CSS px, or a column (sqrt scale, top-level `r`). Axes: the
@@ -35,6 +38,7 @@ import { main, type Pending, type Renderer as ServeRenderer } from "./lib/serve.
 import { type Columns, sqrtRadius } from "./lib/marks.ts";
 import { INK, INK2, PALETTE, tableFile } from "./line.ts";
 import { convexHull } from "./lib/hull.ts";
+import { evaluateNurbsSurface, evaluateSurfaceAnalysis, getKnotSpans, getKnotVectors, getNurbsSurfaceError, NurbsColorBy, type NurbsSurface } from "./lib/nurbs.ts";
 import { normalRng } from "./lib/specfun.ts";
 import { drawSliders, resolveSliders, type Slider, type SliderDef, sliderHeight } from "./lib/sliders.ts";
 
@@ -45,17 +49,20 @@ const FOV = 40;
 const FIT_MARGIN = 1.04;
 const PAD = 0.03; // of each axis' range, around the data
 const MAX_ROWS = 1_000_000;
+const MAX_TRIS = 900_000; // a surface's: 144 bytes each, under the 128 MiB storage binding
 
 type Value = number | string | null;
 type Channel = string | number;
 
 export interface SceneMark {
-  type: "dot" | "line" | "mesh";
+  type: "dot" | "line" | "mesh" | "surface";
   data?: Columns | Record<string, Value>[];
   file?: string; // CSV/TSV with a header row, or JSON columns / rows
   gen?: { name: "ball" | "torus" | "clusters"; n?: number; seed?: number; k?: number; noise?: number };
   vertices?: number[][]; // mesh
   faces?: number[][]; // mesh: row (vertex) indices, counter-clockwise seen from outside
+  nurbs?: NurbsSurface | NurbsSurface[]; // surface: its patches
+  resolution?: number; // surface: steps along u and along v, shared among the knot spans (32)
   x?: Channel;
   y?: Channel;
   z?: Channel;
@@ -334,6 +341,55 @@ function hexColor(v: string): [number, number, number] | null {
   return [0, 2, 4].map((i) => srgbToLinear(parseInt(h.slice(i, i + 2), 16) / 255)) as [number, number, number];
 }
 
+/** A surface mark's patches as a mesh: a grid per knot span, the columns x, y, z and `field` (the
+ * first of `fields`, in the same rational basis), unit normals per row, and the triangles that
+ * have an area (a patch edge collapsed to a point leaves none behind). */
+function tessellate(m: SceneMark, where: string): { cols: Columns; faces: number[][]; normals: Float64Array } {
+  const patches = Array.isArray(m.nurbs) ? m.nurbs : [m.nurbs!];
+  const res = m.resolution ?? 32;
+  if (m.slice !== undefined) throw new Error(`${where}: a surface takes no slice`);
+  if (!patches.length || patches.length > 256) throw new Error(`${where}: nurbs: give 1 to 256 patches`);
+  if (!(Number.isInteger(res) && res >= 1 && res <= 512)) throw new Error(`${where}: resolution must be an integer in [1, 512]`);
+  let tris = 0;
+  const x: number[] = [], y: number[] = [], z: number[] = [], field: number[] = [], normals: number[] = [], faces: number[][] = [];
+  const sliver = (f: number[]) => {
+    const [u, v] = [1, 2].map((c) => [x[f[c]] - x[f[0]], y[f[c]] - y[f[0]], z[f[c]] - z[f[0]]]);
+    const area = Math.hypot(u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0]);
+    return !(area > 1e-12 * (u[0] ** 2 + u[1] ** 2 + u[2] ** 2 + v[0] ** 2 + v[1] ** 2 + v[2] ** 2));
+  };
+  patches.forEach((s, k) => {
+    let error: string | undefined;
+    try { error = getNurbsSurfaceError(s); } catch { error = "give {degrees: [p, q], shape: [nu, nv], points, weights, knots: [u, v]}"; }
+    if (error) throw new Error(`${where}: nurbs${patches.length > 1 ? `[${k}]` : ""}: ${error}`);
+    const [U, V] = getKnotVectors(s).map(getKnotSpans);
+    const [nu, nv] = [U, V].map((spans) => Math.ceil(res / spans.length));
+    tris += U.length * V.length * 2 * nu * nv;
+    if (x.length + U.length * V.length * (nu + 1) * (nv + 1) > MAX_ROWS || tris > MAX_TRIS) throw new Error(`${where}: more than ${MAX_ROWS} vertices or ${MAX_TRIS} triangles: lower resolution`);
+    for (const a of U) {
+      for (const b of V) {
+        const base = x.length;
+        for (let i = 0; i <= nu; i += 1) {
+          for (let j = 0; j <= nv; j += 1) {
+            const [u, v] = [a.start + ((a.end - a.start) * i) / nu, b.start + ((b.end - b.start) * j) / nv];
+            const { point, normal } = evaluateNurbsSurface(s, u, v, [a.index, b.index]);
+            x.push(point[0]), y.push(point[1]), z.push(point[2]), normals.push(...normal);
+            field.push(evaluateSurfaceAnalysis(s, u, v, s.fields?.[0])[NurbsColorBy.Field]);
+          }
+        }
+        for (let i = 0; i < nu; i += 1) {
+          for (let j = 0; j < nv; j += 1) {
+            const p = base + i * (nv + 1) + j, q = p + nv + 1;
+            for (const f of [[p, q, p + 1], [p + 1, q, q + 1]]) if (!sliver(f)) faces.push(f);
+          }
+        }
+      }
+    }
+  });
+  const hasField = patches.some((s) => s.fields?.[0]);
+  if ((m.fill ?? m.stroke) === "field" && !hasField) throw new Error(`${where}: fill: "field" needs the patch's fields: [nu*nv control values]`);
+  return { cols: { x, y, z, ...(hasField ? { field } : {}) }, faces, normals: Float64Array.from(normals) };
+}
+
 /** A mark resolved: positions (data space), colours, and what hover reports. */
 interface Built {
   index: number;
@@ -348,6 +404,7 @@ interface Built {
   radius?: Float32Array; // dot: CSS px per row
   opacity: number;
   faces?: number[][]; // mesh
+  normals?: Float64Array; // surface: data space, xyz per row
   vertices?: number[]; // mesh: the rows its faces use (hover)
   flat: boolean;
   edges?: [number, number, number] | null;
@@ -367,9 +424,11 @@ function channel(m: SceneMark, k: "x" | "y" | "z", cols: Columns, n: number, whe
 
 function resolveMark(m: SceneMark, index: number): Built {
   const where = `marks[${index}] (${m.type})`;
-  if (!["dot", "line", "mesh"].includes(m.type)) throw new Error(`${where}: type must be dot, line or mesh`);
+  if (!["dot", "line", "mesh", "surface"].includes(m.type)) throw new Error(`${where}: type must be dot, line, mesh or surface`);
+  const surface = m.type === "surface" ? tessellate(m, where) : undefined;
   let cols: Columns;
-  if (m.gen) cols = generate(m.gen, where);
+  if (surface) cols = surface.cols;
+  else if (m.gen) cols = generate(m.gen, where);
   else if (m.file) cols = toColumns(tableFile(m.file), where);
   else if (m.data) cols = toColumns(m.data, where);
   else if (m.vertices) {
@@ -382,8 +441,8 @@ function resolveMark(m: SceneMark, index: number): Built {
   const pos = new Float64Array(3 * n);
   for (let i = 0; i < n; i += 1) [pos[3 * i], pos[3 * i + 1], pos[3 * i + 2]] = [X[i], Y[i], Z[i]];
   const b: Built = {
-    index, type: m.type, label: m.label, cols, pos, color: new Float32Array(4 * n), opacity: Math.min(Math.max(m.opacity ?? 1, 0), 1),
-    flat: (m.shading ?? "flat") === "flat", width: m.width ?? (m.type === "line" ? 2 : 1), edges: null,
+    index, type: surface ? "mesh" : m.type as Built["type"], label: m.label, cols, pos, color: new Float32Array(4 * n), opacity: Math.min(Math.max(m.opacity ?? 1, 0), 1),
+    faces: surface?.faces, normals: surface?.normals, flat: (m.shading ?? (surface ? "smooth" : "flat")) === "flat", width: m.width ?? (m.type === "line" ? 2 : 1), edges: null,
   };
   const fill = m.fill ?? m.stroke;
   if (typeof fill === "string" && Object.hasOwn(cols, fill)) [b.fillCol, b.fillName] = [cols[fill], fill];
@@ -680,15 +739,15 @@ export class ScenePlot implements ServeRenderer<Control> {
         }
       } else {
         const tris = b.opacity < 1 ? tTris : meshData;
-        // smooth: area-weighted vertex normals
-        const normals = new Float64Array(3 * n);
+        // smooth: area-weighted vertex normals, or the surface's own (a normal: scaled by the inverse aspect)
+        const normals = b.normals?.map((v, i) => v / box.scale[i % 3]) ?? new Float64Array(3 * n);
         const faceN = (f: number[]) => {
           const [p, q, r] = f.map(W);
           const u = [q[0] - p[0], q[1] - p[1], q[2] - p[2]], v = [r[0] - p[0], r[1] - p[1], r[2] - p[2]];
           return [u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0]];
         };
         const faces = b.faces!.filter((f) => f.every((i) => this.on(b, i) && ok(W(i)))); // drawable: finite corners in the slice
-        if (!b.flat) for (const f of faces) { const fn = faceN(f); for (const i of f) for (let c = 0; c < 3; c += 1) normals[3 * i + c] += fn[c]; }
+        if (!b.flat && !b.normals) for (const f of faces) { const fn = faceN(f); for (const i of f) for (let c = 0; c < 3; c += 1) normals[3 * i + c] += fn[c]; }
         const edges = new Set<string>();
         for (const f of faces) {
           const ps = f.map(W);

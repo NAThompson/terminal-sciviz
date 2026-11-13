@@ -199,6 +199,19 @@ const frame = async (over: Partial<Control>) => {
   const pts = [...cube(0), ...cube(10)];
   const hulls = await sframe({ marks: [{ type: "dot", data: { x: pts.map((p) => p[0]), y: pts.map((p) => p[1]), z: pts.map((p) => p[2]), t: pts.map((_, i) => (i < 8 ? 0 : 1)) }, transform: { hull: true }, slice: "t" }] as SceneControl["marks"], sliderValues: { t: 1 } });
   check("scene: a hull per slice (a cube's 12 triangles, not the hull of both)", () => hulls.gpu.mesh.count === 0 && (hulls as unknown as { gpu: { blend: { tris: Float32Array } } }).gpu.blend.tris.length / 36 === 12 || `opaque ${hulls.gpu.mesh.count}, translucent ${(hulls as unknown as { gpu: { blend: { tris: Float32Array } } }).gpu.blend.tris.length / 36}`);
+  // a bilinear patch with an edge collapsed (a triangle), its field z, and a dot beyond the field's range
+  const nurbs = { degrees: [1, 1], shape: [2, 2], points: [0, 0, 1, 0, 0, 1, 1, 0, 0, 0, 1, 0], weights: [1, 1, 1, 1], knots: [[0, 0, 1, 1], [0, 0, 1, 1]], fields: [[1, 1, 0, 0]] };
+  const surfaceMarks = [{ type: "surface", nurbs, fill: "field", resolution: 4 }, { type: "dot", data: { x: [0], y: [0], z: [0], f: [3] }, fill: "f" }] as SceneControl["marks"];
+  const surf = await sframe({ marks: surfaceMarks });
+  const domain = (surf.state({ ...SCENE_DEFAULTS, marks: surfaceMarks } as SceneControl, 0, null, 0) as { colorDomain: number[] }).colorDomain;
+  check("scene: a surface's triangles without the collapsed edge's (28 of 32), one colour domain with the dots", () =>
+    (surf.gpu.mesh.count === 3 * 28 && domain[0] === 0 && domain[1] === 3) || JSON.stringify([surf.gpu.mesh.count, domain]));
+  const refused: string[] = [];
+  for (const over of [{ slice: "field" }, { resolution: 1.9 }, { nurbs: [nurbs, nurbs, nurbs], resolution: 512 }]) {
+    refused.push(await sframe({ marks: [{ type: "surface", nurbs, ...over }] as SceneControl["marks"] }).then(() => "drawn", (err) => (err as Error).message));
+  }
+  check("scene: a surface refuses a slice, a fractional resolution, more triangles than the mesh buffer holds", () =>
+    (/no slice/.test(refused[0]) && /integer in \[1, 512\]/.test(refused[1]) && /900000 triangles/.test(refused[2])) || JSON.stringify(refused));
 }
 
 console.log(bad ? `${bad} failed` : "all passed");
