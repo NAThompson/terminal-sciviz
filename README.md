@@ -21,10 +21,10 @@ snapshot of exactly what you see.
   - `complex.ts`: domain colouring of complex functions, evaluated per pixel.
   - `volume.ts`: ray-marched volumes and GPU marching-cubes isosurfaces, generated or read from
     `.npy` / raw `.f32` files (4D stacks with a slice slider, NaN transparent).
-  - `scene.ts`: 3D marks: point clouds as sphere impostors, polylines, meshes, convex hulls, NURBS patches.
+  - `scene.ts`: 3D marks: point clouds as sphere impostors, polylines, meshes, convex hulls, NURBS patches, a ray-marched volume among them.
   - Function curves (Bessel functions, expressions, …) are sampled in f64 by Boost.Math's
     WebAssembly build, orbitals by compute shaders; text is drawn from a signed-distance-field font on the GPU.
-- **A gallery** of 62 entries (lines, curves, complex, volumes, scenes) that doubles as a regression test.
+- **A gallery** of 63 entries (lines, curves, complex, volumes, scenes) that doubles as a regression test.
 - `overlay/`: an experimental native macOS window that draws WebGPU straight to the screen over
   the chat at the display's refresh rate.
 

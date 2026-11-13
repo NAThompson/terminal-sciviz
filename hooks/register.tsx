@@ -1028,7 +1028,8 @@ export const register: Register = (on, options) => {
     for (const m of Array.isArray(input.marks) ? input.marks : []) {
       const f = m?.file
       if (f === undefined) continue
-      if (typeof f !== 'string' || !f.startsWith('/') || !/\.(json|csv|tsv)$/i.test(f)) return { deny: `file must be an absolute path to a .json, .csv or .tsv file: ${f}` }
+      const ext = m.type === 'volume' ? ['npy', 'f32', 'bin'] : ['json', 'csv', 'tsv']
+      if (typeof f !== 'string' || !f.startsWith('/') || !ext.includes(f.split('.').pop()!.toLowerCase())) return { deny: `file must be an absolute path to a .${ext[0]}, .${ext[1]} or .${ext[2]} file: ${f}` }
       if (!(await $.fs.exists(f))) return { deny: `no such file: ${f}` }
     }
     // new `marks`: a new scene (fields not given: defaults); without, the fields given change the current one
@@ -1253,11 +1254,12 @@ export const register: Register = (on, options) => {
       description:
         'Show the user a live 3D scene of your own data inline in the chat, right here between your text (WebGPU; they drag to orbit, ' +
         'shift-drag/+/- to zoom, hover a point for its row, r resets). Built from `marks` like `chart`: dot (3D scatter, point clouds: ' +
-        'shaded spheres, 10⁵ points stay fast), line (3D polylines), mesh (triangles), each over `data` columns or a `file`, surface (NURBS / Bézier patches, exact). ' +
+        'shaded spheres, 10⁵ points stay fast), line (3D polylines), mesh (triangles), each over `data` columns or a `file`, surface (NURBS / Bézier patches, exact), volume (a ray-marched 3D field around them, one per scene). ' +
         'Examples: scatter {type:"dot", data, x:"a", y:"b", z:"c", fill:"species"}; point cloud coloured by a value {type:"dot", file, fill:"t", r:1.5}; ' +
         'convex hull over points {type:"dot", data, transform:{hull:true}} plus the points themselves as a second dot mark; ' +
         'surface mesh {type:"mesh", vertices:[[x,y,z],...], faces:[[i,j,k],...], shading:"smooth"}; ' +
-        'exact patch under points on one colour scale {type:"surface", nurbs:{degrees:[2,2], shape:[3,3], points, weights, knots, fields:[f]}, fill:"field"} plus {type:"dot", data, fill:"f"}. ' +
+        'exact patch under points on one colour scale {type:"surface", nurbs:{degrees:[2,2], shape:[3,3], points, weights, knots, fields:[f]}, fill:"field"} plus {type:"dot", data, fill:"f"}; ' +
+        'a field with a surface and points in it {type:"volume", file:"/abs/g.npy", extent:[[0,2],[0,2],[0,2]], opacity:0.05} plus an opaque surface or mesh and dots: rays end at them, so points inside are tinted by the field in front. ' +
         'Axes: a box with ticks on the edges facing the camera, equal aspect unless `aspect`. A call with `marks` opens a new scene; ' +
         'without, it changes only the fields given (camera, title, aspect...). Waits for the frame and returns the control, renderer state ' +
         '(camera, box, hover row) and a PNG snapshot path you can Read to see what the user sees.',
@@ -1268,20 +1270,24 @@ export const register: Register = (on, options) => {
           subtitle: { type: 'string', description: 'dimmer text after the title' },
           marks: {
             type: 'array',
-            description: 'drawn together, depth-tested; translucent ones (opacity < 1) after the opaque, so what is behind them shows through dimmed',
+            description: 'drawn together, depth-tested; translucent ones (opacity < 1) after the opaque, so what is behind them shows through dimmed; a volume after the opaque (which cut its rays) and under the translucent (drawn over it, untinted)',
             items: {
               type: 'object',
               properties: {
-                type: { type: 'string', enum: ['dot', 'line', 'mesh', 'surface'], description: 'dot: x, y, z (fill, r); line: x, y, z in row order, one polyline per `group`; mesh: vertices + faces, or x, y, z columns + faces (row indices); surface: `nurbs`, drawn as a smooth mesh (fill, opacity, edges, shading; no data, no slice)' },
+                type: { type: 'string', enum: ['dot', 'line', 'mesh', 'surface', 'volume'], description: 'dot: x, y, z (fill, r); line: x, y, z in row order, one polyline per `group`; mesh: vertices + faces, or x, y, z columns + faces (row indices); surface: `nurbs`, drawn as a smooth mesh (fill, opacity, edges, shading; no data, no slice); volume: a 3D array `file` over `extent`, ray-marched on the colour scale of the numeric fills (`color`; `domain`, `threshold`, `opacity`; no slice)' },
                 data: { description: 'columns {name: [...], ...} (one length) or rows [{name: value, ...}, ...]; null: a gap' },
-                file: { type: 'string', description: 'instead of data: absolute path to a .csv/.tsv with a header row or .json (columns or rows); for more than 64 kB' },
+                file: { type: 'string', description: 'instead of data: absolute path to a .csv/.tsv with a header row or .json (columns or rows); for more than 64 kB; volume: a .npy (3D, little-endian f4/f8, C order) or raw .f32 / .bin with `shape`; NaN is clear' },
+                shape: { type: 'array', items: { type: 'integer' }, description: 'volume, raw file: [nz, ny, nx] (x fastest)' },
+                extent: { type: 'array', items: { type: 'array', items: { type: 'number' } }, description: 'volume: [[x0, x1], [y0, y1], [z0, z1]], the positions of its first and last samples (default: their indices)' },
+                domain: { type: 'array', items: { type: 'number' }, description: 'volume: [lo, hi] of the colour scale (default: its range with the numeric fills\'; `color.domain` overrides)' },
+                threshold: { type: 'number', description: 'volume: clear below this fraction of the colour domain (0.1)' },
                 x: { type: ['string', 'number'], description: 'a column name or a constant (default: the column "x")' },
                 y: { type: ['string', 'number'] }, z: { type: ['string', 'number'] },
                 fill: { type: 'string', description: 'colour: a column (strings: categories, Okabe–Ito, a legend entry each, at most 7; numbers: the colormap and a colour bar) or #rrggbb; surface: "field" (the patch\'s first field, on the colour scale of the numeric fills) or #rrggbb; stroke is the same channel' },
                 stroke: { type: 'string' },
                 r: { type: ['string', 'number'], description: 'dot radius: CSS px (3) or a column (sqrt scale, top-level `r`)' },
                 group: { type: 'string', description: 'line: a column splitting rows into polylines (default: a categorical fill)' },
-                opacity: { type: 'number', description: '0..1 (hull: 0.35)' },
+                opacity: { type: 'number', description: '0..1 (hull: 0.35); volume: opacity at the top of the domain per 1/56 of its largest side (0.25; lower to see deep into a dense field)' },
                 width: { type: 'number', description: 'line and edge width, CSS px (line 2, edges 1)' },
                 vertices: { type: 'array', items: { type: 'array', items: { type: 'number' } }, description: 'mesh: [[x, y, z], ...]' },
                 faces: { type: 'array', items: { type: 'array', items: { type: 'integer' } }, description: 'mesh: [[i, j, k], ...] vertex/row indices, counter-clockwise seen from outside' },

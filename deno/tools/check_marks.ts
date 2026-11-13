@@ -212,6 +212,23 @@ const frame = async (over: Partial<Control>) => {
   }
   check("scene: a surface refuses a slice, a fractional resolution, more triangles than the mesh buffer holds", () =>
     (/no slice/.test(refused[0]) && /integer in \[1, 512\]/.test(refused[1]) && /900000 triangles/.test(refused[2])) || JSON.stringify(refused));
+  // a 2×2×2 field 0..7 over a 4 × 2 × 1 box, a dot beyond its range; then 16 values (4D: two slices)
+  const file = Deno.makeTempFileSync({ suffix: ".f32" });
+  const write = (n: number) => Deno.writeFileSync(file, new Uint8Array(Float32Array.from({ length: n }, (_, i) => i % 8).buffer));
+  const volume = { type: "volume", file, shape: [2, 2, 2], extent: [[0, 4], [0, 2], [0, 1]] };
+  const volumeMarks = [volume, { type: "dot", data: { x: [0], y: [0], z: [0], f: [9] }, fill: "f" }] as SceneControl["marks"];
+  write(8);
+  const vol = (await sframe({ marks: volumeMarks })).state({ ...SCENE_DEFAULTS, marks: volumeMarks } as SceneControl, 0, null, 0) as { colorDomain: number[]; marks: { shape?: number[] }[]; box: { hi: number[] } };
+  check("scene: a volume's shape, its extent in the box, one colour domain with the dots", () =>
+    (vol.marks[0].shape!.join() === "2,2,2" && vol.box.hi[0] > 4 && vol.colorDomain.join() === "0,9") || JSON.stringify(vol));
+  write(16);
+  const denied: string[] = [];
+  for (const marks of [[volume], [{ ...volume, shape: [2, 2, 2, 2] }], [{ ...volume, shape: [2, 2, 4], slice: "t" }], [{ ...volume, shape: [2, 2, 4] }, { ...volume, shape: [2, 2, 4] }]]) {
+    denied.push(await sframe({ marks: marks as SceneControl["marks"] }).then(() => "drawn", (err) => (err as Error).message));
+  }
+  Deno.removeSync(file);
+  check("scene: a volume refuses a shape that is not the file's, a 4D array, a slice, a second volume", () =>
+    (/shape \[1,2,2,2\] of f32 needs 32/.test(denied[0]) && /4D array \(2 slices\)/.test(denied[1]) && /no slice/.test(denied[2]) && /one volume per scene/.test(denied[3])) || JSON.stringify(denied));
 }
 
 console.log(bad ? `${bad} failed` : "all passed");

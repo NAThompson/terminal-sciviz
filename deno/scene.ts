@@ -13,6 +13,13 @@
  * - surface: `nurbs`, a NURBS / Bézier patch or an array of them (lib/nurbs.ts, as surface.ts takes
  *   them), evaluated in f64 on a grid per knot span (`resolution` steps along u and v, 32) and drawn
  *   as a smooth mesh with the evaluator's normals; `fill: "field"` colours it by its first field.
+ * - volume: a 3D scalar field (`file`: a .npy or raw .f32 with `shape`, as volume.ts reads them; one
+ *   per scene) over `extent` [[x0, x1], [y0, y1], [z0, z1]] (its first and last samples; default:
+ *   their indices), ray-marched (emission-absorption, `opacity` per 1/56 of the box, clear below
+ *   `threshold`) on the colour scale of the numeric fills (`domain`, else its range). Drawn after
+ *   everything opaque, each ray ending at the opaque depth (the farthest of the pixel's samples):
+ *   dots, lines and opaque meshes inside it are tinted by the field in front of them. Translucent
+ *   marks are drawn over it, untinted.
  *
  * fill: a column (strings: the Okabe–Ito palette, a legend entry each; numbers: a colour map with a
  * colour bar) or a #rrggbb colour; r: CSS px, or a column (sqrt scale, top-level `r`). Axes: the
@@ -29,8 +36,8 @@
 
 import { axisTicks, formatNumber } from "./lib/scales.ts";
 import { cameraBasis, fitAngles, fitView, screenRect, type Vec3 } from "./lib/framing.ts";
-import { lookAtView, mul4, perspectiveProjection } from "./lib/mat4.ts";
-import { colormapName, colormapRgb, srgbToLinear } from "./lib/colormaps.ts";
+import { inverse4, lookAtView, mul4, perspectiveProjection } from "./lib/mat4.ts";
+import { colormapLut, colormapName, colormapRgb, srgbToLinear } from "./lib/colormaps.ts";
 import { createBuffer, makeReadBuffer, requestGpuDevice, rowBytes, STORAGE, TextureTarget, UNIFORM } from "./lib/gpu.ts";
 import { DEPTH_FORMAT, getTargets, type RenderTargets, SAMPLE_COUNT } from "./lib/gpu_surface.ts";
 import { BitmapFont, type FontSize, FRAME_FORMAT, OverlayRenderer, premul, Quads, type Rgba } from "./lib/overlay.ts";
@@ -41,6 +48,8 @@ import { convexHull } from "./lib/hull.ts";
 import { evaluateNurbsSurface, evaluateSurfaceAnalysis, getKnotSpans, getKnotVectors, getNurbsSurfaceError, NurbsColorBy, type NurbsSurface } from "./lib/nurbs.ts";
 import { normalRng } from "./lib/specfun.ts";
 import { drawSliders, resolveSliders, type Slider, type SliderDef, sliderHeight } from "./lib/sliders.ts";
+import { readSlice } from "./lib/stack.ts";
+import { readStack } from "./volume.ts";
 
 const GRID = "#262c36", EDGE = "#30363d", HOVER_RING = "#e6edf3";
 const LABEL_FILL: Rgba = [20 / 255 * (240 / 255), 24 / 255 * (240 / 255), 30 / 255 * (240 / 255), 240 / 255];
@@ -50,15 +59,21 @@ const FIT_MARGIN = 1.04;
 const PAD = 0.03; // of each axis' range, around the data
 const MAX_ROWS = 1_000_000;
 const MAX_TRIS = 900_000; // a surface's: 144 bytes each, under the 128 MiB storage binding
+const MAX_VOXELS = 2 ** 26; // a volume's: 4 bytes each
+const OPACITY_VOXELS = 56; // a volume's opacity is per 1/56 of its largest side, as volume.ts's
 
 type Value = number | string | null;
 type Channel = string | number;
 
 export interface SceneMark {
-  type: "dot" | "line" | "mesh" | "surface";
+  type: "dot" | "line" | "mesh" | "surface" | "volume";
   data?: Columns | Record<string, Value>[];
-  file?: string; // CSV/TSV with a header row, or JSON columns / rows
-  gen?: { name: "ball" | "torus" | "clusters"; n?: number; seed?: number; k?: number; noise?: number };
+  file?: string; // CSV/TSV with a header row, or JSON columns / rows; volume: .npy, or raw .f32 / .bin with `shape`
+  gen?: { name: "ball" | "torus" | "clusters" | "gaussian"; n?: number; seed?: number; k?: number; noise?: number };
+  shape?: number[]; // volume, raw file: [nz, ny, nx]
+  extent?: [number, number][]; // volume: x, y, z of its first and last samples (default: their indices)
+  threshold?: number; // volume: clear below it, of the colour domain (0.1)
+  domain?: [number, number]; // volume: its colour domain (default: its range, with the numeric fills')
   vertices?: number[][]; // mesh
   faces?: number[][]; // mesh: row (vertex) indices, counter-clockwise seen from outside
   nurbs?: NurbsSurface | NurbsSurface[]; // surface: its patches
@@ -265,6 +280,66 @@ const LINE_WGSL = COMMON_WGSL + /* wgsl */ `
   }
 `;
 
+const VOLUME_WGSL = COMMON_WGSL + /* wgsl */ `
+  struct Volume { toTex: mat4x4f, dims: vec4f, map: vec4f, per: vec4f } // view space to the box [0, 1]³; map: (unused, unused), threshold, opacity
+  @group(1) @binding(0) var<uniform> vol: Volume;
+  @group(1) @binding(1) var field: texture_3d<f32>; // value over the colour domain, validity
+  @group(1) @binding(2) var linear: sampler;
+  @group(1) @binding(3) var lut: texture_2d<f32>;
+  @group(1) @binding(4) var depth: texture_depth_multisampled_2d;
+
+  @vertex
+  fn vertexMain(@builtin(vertex_index) v: u32) -> @builtin(position) vec4f {
+    return vec4f(f32(v & 1u) * 4.0 - 1.0, f32(v >> 1u) * 4.0 - 1.0, 0.0, 1.0);
+  }
+
+  @fragment
+  fn fragmentMain(@builtin(position) position: vec4f) -> @location(0) vec4f {
+    // the ray through the pixel, in view space (z = -1: its parameter is the view depth), and in the box
+    let ndc = position.xy / u.size * vec2f(2.0, -2.0) + vec2f(-1.0, 1.0);
+    let ray = vec3f((ndc + u.proj[2].xy - u.proj[3].xy) / vec2f(u.proj[0][0], u.proj[1][1]), -1.0);
+    let o = (vol.toTex * vec4f(0.0, 0.0, 0.0, 1.0)).xyz;
+    let d = (vol.toTex * vec4f(ray, 0.0)).xyz;
+    let t0 = -o / d;
+    let t1 = (1.0 - o) / d;
+    let a = max(max(min(t0.x, t1.x), min(t0.y, t1.y)), max(min(t0.z, t1.z), 0.0));
+    var b = min(min(max(t0.x, t1.x), max(t0.y, t1.y)), max(t0.z, t1.z));
+    var z = 0.0; // the opaque geometry: the farthest of the pixel's samples (its edges keep the field behind them)
+    for (var k = 0; k < ${SAMPLE_COUNT}; k++) {
+      z = max(z, textureLoad(depth, vec2i(position.xy), k));
+    }
+    if (z < 1.0) {
+      b = min(b, u.proj[3][2] / (2.0 * z - 1.0 + u.proj[2][2]));
+    }
+    if (!(a < b)) {
+      discard;
+    }
+    let cells = vol.dims.xyz - 1.0;
+    let steps = clamp(ceil((b - a) * length(d * cells) * 2.0), 1.0, 1024.0); // two per voxel
+    let dt = (b - a) / steps;
+    let exponent = dt * length(ray) * vol.per.x; // the step over the reference length: alike at every resolution
+    let jitter = fract(52.9829189 * fract(dot(position.xy, vec2f(0.06711056, 0.00583715))));
+    var acc = vec4f(0.0);
+    for (var i = 0.0; i < steps; i += 1.0) {
+      let p = o + d * (a + (i + jitter) * dt);
+      let s = textureSampleLevel(field, linear, (p * cells + 0.5) / vol.dims.xyz, 0.0).rg;
+      let t = s.r;
+      if (s.g > 0.999 && t > vol.map.z) {
+        let alpha = 1.0 - pow(1.0 - clamp(vol.map.w * (t - vol.map.z) / (1.0 - vol.map.z), 0.0, 0.999), exponent);
+        let c = textureSampleLevel(lut, linear, vec2f((clamp(t, 0.0, 1.0) * 255.0 + 0.5) / 256.0, 0.5), 0.0).rgb;
+        acc += (1.0 - acc.a) * vec4f(c * alpha, alpha);
+        if (acc.a > 0.98) {
+          break;
+        }
+      }
+    }
+    if (acc.a < 0.002) {
+      discard;
+    }
+    return acc;
+  }
+`;
+
 // --- Data -------------------------------------------------------------------------------------------
 
 const num = (v: Value | undefined): number => (v === null || v === undefined || v === "" ? NaN : Number(v));
@@ -390,10 +465,58 @@ function tessellate(m: SceneMark, where: string): { cols: Columns; faces: number
   return { cols: { x, y, z, ...(hasField ? { field } : {}) }, faces, normals: Float64Array.from(normals) };
 }
 
+/** A volume mark's field: the file's 3D array (as volume.ts reads it) or a generated one (`gaussian`:
+ * exp(−4r²) over [−1, 1]³, n³ samples);
+ * its rows are the corners of its extent (the scene's box), not drawn. */
+function resolveVolume(m: SceneMark, index: number, where: string): Built {
+  if (m.slice !== undefined) throw new Error(`${where}: a volume takes no slice`);
+  let dims: number[], values: Float32Array;
+  if (m.gen) {
+    const n = Math.trunc(m.gen.n ?? 48);
+    if (m.gen.name !== "gaussian" || !(n >= 2 && n <= 256)) throw new Error(`${where}: gen must be {name: "gaussian", n in [2, 256]}`);
+    const c = (k: number) => ((2 * k) / (n - 1) - 1) ** 2;
+    [dims, values] = [[n, n, n], Float32Array.from({ length: n ** 3 }, (_, i) => Math.exp(-4 * (c(i % n) + c(Math.trunc(i / n) % n) + c(Math.trunc(i / n / n)))))];
+  } else {
+    if (typeof m.file !== "string") throw new Error(`${where}: give file (a .npy, or raw .f32 / .bin with shape [nz, ny, nx])`);
+    try {
+      const st = readStack({ dataset: "file", path: m.file, shape: m.shape });
+      if (st.slices > 1) throw new Error(`a 4D array (${st.slices} slices): a scene's volume is 3D, [nz, ny, nx]`);
+      if (st.shape[0] * st.shape[1] * st.shape[2] > MAX_VOXELS) throw new Error(`shape [${st.shape}]: more than ${MAX_VOXELS} voxels`);
+      [dims, values] = [[...st.shape].reverse(), readSlice(st, 0)];
+    } catch (err) {
+      throw new Error(`${where}: ${(err as Error).message}`);
+    }
+  }
+  const extent = m.extent ?? dims.map((n) => [0, n - 1]);
+  if (!Array.isArray(extent) || extent.length !== 3 || extent.some((e) => !Array.isArray(e) || e.length !== 2 || !e.every(Number.isFinite) || !(e[1] > e[0]))) {
+    throw new Error(`${where}: extent must be [[x0, x1], [y0, y1], [z0, z1]], each increasing`);
+  }
+  const [domain, threshold] = [m.domain, m.threshold ?? 0.1];
+  if (domain !== undefined && !(Array.isArray(domain) && domain.length === 2 && domain.every(Number.isFinite) && domain[1] > domain[0])) throw new Error(`${where}: domain must be [lo, hi], increasing`);
+  if (!(threshold >= 0 && threshold < 1)) throw new Error(`${where}: threshold must be in [0, 1)`);
+  let [lo, hi] = [Infinity, -Infinity];
+  for (let i = 0; i < values.length; i += 1) {
+    const v = values[i];
+    if (Number.isFinite(v)) {
+      if (v < lo) lo = v;
+      if (v > hi) hi = v;
+    }
+  }
+  if (!(hi >= lo)) throw new Error(`${where}: no finite value`);
+  const corner = (k: number) => Array.from({ length: 8 }, (_, c) => extent[k][(c >> k) & 1]);
+  const [x, y, z] = [corner(0), corner(1), corner(2)];
+  return {
+    index, type: "volume", label: m.label, cols: { x, y, z }, pos: Float64Array.from({ length: 24 }, (_, i) => [x, y, z][i % 3][Math.trunc(i / 3)]),
+    color: new Float32Array(32), opacity: 0, flat: true, width: 0, edges: null, // (no rows to draw or hover)
+    volume: { dims, data: values, range: [lo, hi], domain, threshold, opacity: Math.max(m.opacity ?? 0.25, 0), lo: extent.map((e) => e[0]) as Vec3, hi: extent.map((e) => e[1]) as Vec3 },
+  };
+}
+
 /** A mark resolved: positions (data space), colours, and what hover reports. */
 interface Built {
   index: number;
-  type: "dot" | "line" | "mesh";
+  type: "dot" | "line" | "mesh" | "volume";
+  volume?: { dims: number[]; data: Float32Array; range: [number, number]; domain?: [number, number]; threshold: number; opacity: number; lo: Vec3; hi: Vec3 }; // dims: x, y, z
   label?: string;
   cols: Columns; // for hover: every column of a row
   pos: Float64Array; // data space, xyz per row
@@ -424,7 +547,8 @@ function channel(m: SceneMark, k: "x" | "y" | "z", cols: Columns, n: number, whe
 
 function resolveMark(m: SceneMark, index: number): Built {
   const where = `marks[${index}] (${m.type})`;
-  if (!["dot", "line", "mesh", "surface"].includes(m.type)) throw new Error(`${where}: type must be dot, line, mesh or surface`);
+  if (!["dot", "line", "mesh", "surface", "volume"].includes(m.type)) throw new Error(`${where}: type must be dot, line, mesh, surface or volume`);
+  if (m.type === "volume") return resolveVolume(m, index, where);
   const surface = m.type === "surface" ? tessellate(m, where) : undefined;
   let cols: Columns;
   if (surface) cols = surface.cols;
@@ -523,6 +647,8 @@ interface Gpu {
   segs: { buf: GPUBuffer; count: number; group?: GPUBindGroup };
   blend: Blend;
 }
+/** The volume mark's field (value, validity), the colour map, its uniforms. */
+interface Vol { field: GPUTexture; lut: GPUTexture; uniform: GPUBuffer; sampler: GPUSampler; of: NonNullable<Built["volume"]> }
 interface Blend {
   dots: Float32Array; // 8 per dot: xyz, r, rgba
   tris: Float32Array; // 36 per triangle: 3 corners as the mesh buffer's
@@ -538,11 +664,12 @@ export class ScenePlot implements ServeRenderer<Control> {
   private readonly canvas: TextureTarget;
   private readonly frameReads: GPUBuffer[] = [];
   private readonly uniform: GPUBuffer;
-  private readonly pipes: Record<"line" | "lineBlend" | "dot" | "dotBlend" | "mesh" | "meshBlend", GPURenderPipeline>;
+  private readonly pipes: Record<"line" | "lineBlend" | "dot" | "dotBlend" | "mesh" | "meshBlend" | "volume", GPURenderPipeline>;
   private targets?: RenderTargets;
   private dataKey?: string;
   private built: Built[] = [];
   private gpu?: Gpu;
+  private vol?: Vol;
   private axes?: { buf: GPUBuffer; count: number; group: GPUBindGroup };
   private box: Box = { lo: [-1, -1, -1], hi: [1, 1, 1], centre: [0, 0, 0], scale: [1, 1, 1] };
   private cats: Value[] = [];
@@ -589,6 +716,7 @@ export class ScenePlot implements ServeRenderer<Control> {
       mesh: make(MESH_WGSL),
       meshBlend: make(MESH_WGSL, { blend: true }),
       lineBlend: make(LINE_WGSL, { blend: true }),
+      volume: make(VOLUME_WGSL, { blend: true }),
     };
   }
 
@@ -607,6 +735,7 @@ export class ScenePlot implements ServeRenderer<Control> {
     const key = JSON.stringify([marks, mtimes, ctl.aspect, ctl.color, ctl.r]);
     if (key === this.dataKey) return;
     const built = marks.map((m, i) => resolveMark(m, i));
+    if (built.filter((b) => b.volume).length > 1) throw new Error("marks: one volume per scene");
     // box: every finite point, padded; aspect: equal, auto (each axis normalised) or given
     const lo: Vec3 = [Infinity, Infinity, Infinity], hi: Vec3 = [-Infinity, -Infinity, -Infinity];
     for (const b of built) {
@@ -632,9 +761,33 @@ export class ScenePlot implements ServeRenderer<Control> {
     for (const b of built) {
       if (b.slice) slices[b.slice.name] = [...new Set([...(slices[b.slice.name] ?? []), ...b.slice.at])].filter(Number.isFinite).sort((p, q) => p - q);
     }
+    const of = built.find((b) => b.volume)?.volume;
+    const vol = of && this.uploadVolume(of, bar!);
     // swap (uploaded by `select`)
     this.disposeData();
-    Object.assign(this, { built, box, cats, bar, slices, dataKey: key, uploadKey: undefined });
+    for (const o of this.vol ? [this.vol.field, this.vol.lut, this.vol.uniform] : []) o.destroy();
+    Object.assign(this, { built, box, cats, bar, slices, vol, dataKey: key, uploadKey: undefined });
+  }
+
+  private uploadVolume(of: NonNullable<Built["volume"]>, bar: ColorBar): Vol {
+    const d = this.device;
+    const [nx, ny, nz] = of.dims;
+    const usage = GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST;
+    const field = d.createTexture({ size: [nx, ny, nz], dimension: "3d", format: "rg16float", usage });
+    // the value over the colour domain (kept a domain beyond it, for the interpolation at its ends), validity: NaN and ±∞ are 0, invalid
+    const [d0, d1] = bar.domain, data = new Float16Array(2 * of.data.length);
+    for (let i = 0; i < of.data.length; i += 1) {
+      const v = of.data[i];
+      if (!Number.isFinite(v)) continue;
+      data[2 * i] = Math.min(Math.max((v - d0) / (d1 - d0), -1), 2);
+      data[2 * i + 1] = 1;
+    }
+    d.queue.writeTexture({ texture: field }, data, { bytesPerRow: 4 * nx, rowsPerImage: ny }, [nx, ny, nz]);
+    const lut = d.createTexture({ size: [256, 1], format: "rgba8unorm", usage });
+    d.queue.writeTexture({ texture: lut }, colormapLut(bar.scheme, bar.invert), {}, [256, 1]);
+    const sampler = d.createSampler({ magFilter: "linear", minFilter: "linear" });
+    of.data = new Float32Array(); // uploaded
+    return { field, lut, sampler, uniform: createBuffer(d, 112, UNIFORM), of };
   }
 
   /** The sliders of the slice columns (given, or added), and the GPU buffers of their rows. */
@@ -666,15 +819,17 @@ export class ScenePlot implements ServeRenderer<Control> {
       throw new Error(`fill: ${cats.length} categories (${cats.slice(0, 12).join(", ")}${cats.length > 12 ? ", ..." : ""}); the palette has ${PALETTE.length}: fold the rest into "other", or colour by a number`);
     }
     const numeric = built.filter((b) => b.fillCol && !isCat(b));
+    const vol = built.find((b) => b.volume);
     let bar: ColorBar | undefined;
-    if (numeric.length) {
+    if (numeric.length || vol) {
       let [d0, d1] = [Infinity, -Infinity];
       for (const b of numeric) for (const v of b.fillCol!) if (Number.isFinite(num(v))) [d0, d1] = [Math.min(d0, num(v)), Math.max(d1, num(v))];
-      const given = !isCat(numeric[0]) && scale.domain?.length === 2 ? scale.domain.map(Number) : null;
+      if (vol) [d0, d1] = vol.volume!.domain ?? [Math.min(d0, vol.volume!.range[0]), Math.max(d1, vol.volume!.range[1])];
+      const given = scale.domain?.length === 2 ? scale.domain.map(Number) : null;
       if (given && given.every(Number.isFinite)) [d0, d1] = given;
       if (!(d1 >= d0)) [d0, d1] = [0, 1];
       if (d1 === d0) [d0, d1] = [d0 - 0.5, d1 + 0.5];
-      bar = { label: scale.label ?? numeric[0].fillName!, scheme: colormapName(String(scale.scheme ?? "viridis")) ?? "Viridis", invert: Boolean(scale.invert), domain: [d0, d1] };
+      bar = { label: scale.label ?? numeric[0]?.fillName ?? vol!.label ?? "value", scheme: colormapName(String(scale.scheme ?? "viridis")) ?? "Viridis", invert: Boolean(scale.invert), domain: [d0, d1] };
     }
     const palette = PALETTE.map((h) => hexColor(h)!);
     const nan = hexColor("#6e7681")!;
@@ -721,6 +876,7 @@ export class ScenePlot implements ServeRenderer<Control> {
     for (const b of built) {
       const n = b.pos.length / 3;
       const W = (i: number) => ScenePlot.world(box, b.pos, i);
+      if (b.type === "volume") continue;
       if (b.type === "dot") {
         for (let i = 0; i < n; i += 1) {
           const p = W(i);
@@ -795,7 +951,7 @@ export class ScenePlot implements ServeRenderer<Control> {
     const rows: [string, string][] = this.cats.map((c, i) => [String(c), PALETTE[i]]);
     for (const b of this.built) {
       const m = (ctl.marks as SceneMark[])[b.index];
-      if (!b.label || m.legend === false || (b.fillCol && !b.constColor)) continue;
+      if (!b.label || m.legend === false || (b.fillCol && !b.constColor) || b.volume) continue;
       const fill = m.fill ?? m.stroke;
       rows.push([b.label, typeof fill === "string" && fill.startsWith("#") ? fill : this.cats.length ? INK : PALETTE[0]]);
     }
@@ -1074,9 +1230,12 @@ export class ScenePlot implements ServeRenderer<Control> {
     }
     this.sortBlend();
     const encoder = device.createCommandEncoder();
-    const pass = encoder.beginRenderPass({
-      colorAttachments: [{ view: this.targets.color.createView(), resolveTarget: this.canvas.currentTexture().createView(), clearValue: [0, 0, 0, 0], loadOp: "clear", storeOp: "discard" }],
-      depthStencilAttachment: { view: this.targets.depth.createView(), depthClearValue: 1, depthLoadOp: "clear", depthStoreOp: "discard" },
+    const { vol } = this;
+    const [color, depth, resolveTarget] = [this.targets.color.createView(), this.targets.depth.createView(), this.canvas.currentTexture().createView()];
+    // with a volume, two passes: the opaque (kept), then the volume reading their depth, and the translucent
+    let pass = encoder.beginRenderPass({
+      colorAttachments: [vol ? { view: color, clearValue: [0, 0, 0, 0], loadOp: "clear", storeOp: "store" } : { view: color, resolveTarget, clearValue: [0, 0, 0, 0], loadOp: "clear", storeOp: "discard" }],
+      depthStencilAttachment: { view: depth, depthClearValue: 1, depthLoadOp: "clear", depthStoreOp: vol ? "store" : "discard" },
     });
     const view = device.createBindGroup({ layout: pipes.line.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: this.uniform } }] });
     const viewOf = (p: GPURenderPipeline) => (p === pipes.line ? view : device.createBindGroup({ layout: p.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: this.uniform } }] }));
@@ -1093,6 +1252,20 @@ export class ScenePlot implements ServeRenderer<Control> {
     if (segs.count) run(pipes.line, segs.group ??= this.group(pipes.line, [segs.buf]), 6, segs.count);
     if (dots.count) run(pipes.dot, dots.group ??= this.group(pipes.dot, [dots.buf, dots.colors]), 6, dots.count);
     if (mesh.count) run(pipes.mesh, mesh.group ??= this.group(pipes.mesh, [mesh.buf]), mesh.count, 1);
+    if (vol) {
+      pass.end();
+      pass = encoder.beginRenderPass({
+        colorAttachments: [{ view: color, resolveTarget, loadOp: "load", storeOp: "discard" }],
+        depthStencilAttachment: { view: depth, depthReadOnly: true },
+      });
+      // view space to the box [0, 1]³ of the extent: world / aspect + centre, over the extent
+      const { centre, scale } = this.box, { lo, hi, dims } = vol.of;
+      const k = [0, 1, 2].map((i) => 1 / (scale[i] * (hi[i] - lo[i]))), o = [0, 1, 2].map((i) => (centre[i] - lo[i]) / (hi[i] - lo[i]));
+      const toTex = mul4([k[0], 0, 0, 0, 0, k[1], 0, 0, 0, 0, k[2], 0, o[0], o[1], o[2], 1], inverse4(this.viewM));
+      device.queue.writeBuffer(vol.uniform, 0, Float32Array.from([...toTex, ...dims, 0, 0, 0, vol.of.threshold, vol.of.opacity, OPACITY_VOXELS * Math.min(...k), 0, 0, 0]));
+      const entries = [{ buffer: vol.uniform }, vol.field.createView(), vol.sampler, vol.lut.createView(), depth].map((resource, binding) => ({ binding, resource }));
+      run(pipes.volume, device.createBindGroup({ layout: pipes.volume.getBindGroupLayout(1), entries }), 3, 1);
+    }
     // translucent: back to front, in runs of one kind
     if (blend.runs.length) {
       const [dp, dc, tb, sb] = blend.bufs;
@@ -1198,7 +1371,7 @@ export class ScenePlot implements ServeRenderer<Control> {
   }
 
   state(ctl: Control, generation: number, hover: unknown, ms: number): unknown {
-    const counts = this.built.map((b) => ({ type: b.type, rows: b.pos.length / 3, ...(b.faces ? { faces: b.faces.length } : {}) }));
+    const counts = this.built.map((b) => (b.volume ? { type: b.type, shape: [...b.volume.dims].reverse() } : { type: b.type, rows: b.pos.length / 3, ...(b.faces ? { faces: b.faces.length } : {}) }));
     return {
       generation, width: this.size[0], height: this.size[1], hover, renderMs: Math.round(ms * 1000) / 1000,
       azimuth: ctl.azimuth, elevation: ctl.elevation, distance: this.distance, target: this.target,

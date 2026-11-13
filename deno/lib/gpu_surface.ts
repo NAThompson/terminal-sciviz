@@ -856,7 +856,7 @@ export function getTargets(
   }
   targets?.color.destroy();
   targets?.depth.destroy();
-  const desc = { size, sampleCount: SAMPLE_COUNT, usage: 0x10 }; // `RENDER_ATTACHMENT`
+  const desc = { size, sampleCount: SAMPLE_COUNT, usage: 0x14 }; // `RENDER_ATTACHMENT | TEXTURE_BINDING` (scene.ts's volume reads the depth)
   return {
     color: device.createTexture({ ...desc, format }),
     depth: device.createTexture({ ...desc, format: DEPTH_FORMAT }),

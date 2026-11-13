@@ -31552,5 +31552,104 @@
       "elevation": 20
     },
     "interaction": "orbit"
+  },
+  {
+    "id": "scenes/volume_marks",
+    "section": "scenes",
+    "title": "field, surface, points",
+    "description": "a ray-marched field (a Gaussian) with an opaque patch through it and points: each ray ends at the patch or a point, the points inside tinted by the field in front of them",
+    "renderer": "scene.ts",
+    "control": {
+      "title": "field, surface, points",
+      "subtitle": "one volume mark, composited by depth",
+      "marks": [
+        {
+          "type": "volume",
+          "gen": {
+            "name": "gaussian",
+            "n": 48
+          },
+          "extent": [
+            [
+              -10,
+              10
+            ],
+            [
+              -10,
+              10
+            ],
+            [
+              -10,
+              10
+            ]
+          ],
+          "opacity": 0.12,
+          "label": "field"
+        },
+        {
+          "type": "surface",
+          "nurbs": {
+            "degrees": [
+              1,
+              1
+            ],
+            "shape": [
+              2,
+              2
+            ],
+            "points": [
+              -10,
+              -10,
+              0,
+              -10,
+              10,
+              0,
+              10,
+              -10,
+              0,
+              10,
+              10,
+              0
+            ],
+            "weights": [
+              1,
+              1,
+              1,
+              1
+            ],
+            "knots": [
+              [
+                0,
+                0,
+                1,
+                1
+              ],
+              [
+                0,
+                0,
+                1,
+                1
+              ]
+            ]
+          },
+          "fill": "#8b949e",
+          "resolution": 1
+        },
+        {
+          "type": "dot",
+          "gen": {
+            "name": "ball",
+            "n": 100,
+            "seed": 11
+          },
+          "fill": "#E69F00",
+          "r": 4
+        }
+      ],
+      "color": {
+        "scheme": "magma"
+      }
+    },
+    "interaction": "orbit"
   }
 ]
